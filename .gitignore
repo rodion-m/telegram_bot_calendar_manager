@@ -1,0 +1,4 @@
+.aider*
+.env
+/google_credentials.json
+/google_tokens/*
