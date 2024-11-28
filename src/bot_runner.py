@@ -10,7 +10,6 @@ from telegram.ext import (
 from src.logic import Config, LoggerSetup, GoogleCalendarService, LiteLLMService, StartHandler, ConfirmationHandler, \
     InputHandler, CancelHandler, BotStates
 
-
 def main():
     # Initialize configuration
     config = Config()
@@ -61,6 +60,7 @@ def main():
 
     # Run the bot until Ctrl-C is pressed or the process receives SIGINT, SIGTERM or SIGABRT
     updater.idle()
+
 
 if __name__ == '__main__':
     main()
