@@ -195,14 +195,14 @@ class GoogleCalendarService:
 
                 # Add optional description
                 if event.description:
-                    event_body['description'] = event.description
+                    event_body['description'] = event.description.replace("\\n", "\n")
 
                 # Add connection info to description
                 if event.connection_info:
                     if 'description' in event_body:
-                        event_body['description'] += f"\n\nConnection Info: {event.connection_info}"
+                        event_body['description'] += f"\n\nConnection Info: " + event.connection_info.replace("\\n", " ")
                     else:
-                        event_body['description'] = f"Connection Info: {event.connection_info}"
+                        event_body['description'] = f"Connection Info: " + event.connection_info.replace("\\n", " ")
 
                 created_event = service.events().insert(calendarId='primary', body=event_body).execute()
                 self.logger.debug(f"Created event: {created_event}")
