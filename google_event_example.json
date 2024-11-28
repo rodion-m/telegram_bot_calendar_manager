@@ -1,0 +1,33 @@
+{
+  'created': '2024-11-28T08:52:31.000Z',
+  'creator': {
+    'email': 'rodi@gmail.com',
+    'self': True
+  },
+  'description': 'Онлайн-сессия по адаптации иностранных IT-специалистов, въезду и проживанию в Астане и регистрации в МФЦА. Организаторы: Astana Hub, AIFC, Expat Centre. https://us06web.zoom.us/j/89579085298?pwd=DXDVsh7gzWeKB4D3dz6LSsuSaZdtbC.1',
+  'end': {
+    'dateTime': '2024-11-28T19:00:00+08:00',
+    'timeZone': 'Asia/Almaty'
+  },
+  'etag': '"3465547902228000"',
+  'eventType': 'default',
+  'htmlLink': 'https://www.google.com/calendar/event?eid=NDFtMWk1a2budHVrcGFoZjEzbjE5azEyMjAgcm9kaWNoNjZAbQ',
+  'iCalUID': '41m1i5kentu4pahf13n19k1220@google.com',
+  'id': '41m1i5kentukpahf13319k1220',
+  'kind': 'calendar#event',
+  'organizer': {
+    'email': 'rodi@gmail.com',
+    'self': True
+  },
+  'reminders': {
+    'useDefault': True
+  },
+  'sequence': 0,
+  'start': {
+    'dateTime': '2024-11-28T18:00:00+08:00',
+    'timeZone': 'Asia/Almaty'
+  },
+  'status': 'confirmed',
+  'summary': 'Адаптация международных IT-специалистов в Казахстане',
+  'updated': '2024-11-28T08:52:31.114Z'
+}
