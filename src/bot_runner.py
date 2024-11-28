@@ -8,7 +8,7 @@ from telegram.ext import (
 )
 
 from src.logic import Config, LoggerSetup, GoogleCalendarService, LiteLLMService, StartHandler, ConfirmationHandler, \
-    InputHandler, CancelHandler
+    InputHandler, CancelHandler, BotStates
 
 
 def main():
@@ -32,9 +32,6 @@ def main():
     confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service)
     cancel_handler = CancelHandler(logger)
 
-    # Define conversation states
-    PARSE_INPUT, ASK_TIMEZONE, CONFIRMATION = range(3)
-
     # Define the conversation handler with the states PARSE_INPUT, ASK_TIMEZONE, CONFIRMATION
     conv_handler = ConversationHandler(
         entry_points=[
@@ -45,25 +42,12 @@ def main():
             )
         ],
         states={
-            PARSE_INPUT: [
-                MessageHandler(
-                    (Filters.text | Filters.voice | Filters.audio | Filters.caption) & ~Filters.command,
-                    input_handler.handle
-                ),
+            BotStates.PARSE_INPUT: [
+                MessageHandler(Filters.text | Filters.voice | Filters.audio, input_handler.handle)
             ],
-            ASK_TIMEZONE: [
-                MessageHandler(
-                    Filters.text & ~Filters.command,
-                    input_handler.handle  # You might want a separate handler for receiving timezone
-                ),
+            BotStates.CONFIRMATION: [
+                MessageHandler(Filters.regex('^(Yes|No|Y|N|yes|no|y|n|да|Да|д|Нет|нет|н)$'), confirmation_handler.handle)
             ],
-            CONFIRMATION: [
-                MessageHandler(
-                    Filters.text & ~Filters.command,
-                    confirmation_handler.handle
-                ),
-            ],
-            # Additional states for delete and reschedule can be added here
         },
         fallbacks=[CommandHandler('cancel', cancel_handler.handle)],
     )

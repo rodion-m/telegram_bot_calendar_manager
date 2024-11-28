@@ -3,7 +3,7 @@ import datetime
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 import litellm
 import pytz
@@ -14,14 +14,23 @@ from googleapiclient.discovery import build
 from pydantic import BaseModel, Field
 from tzlocal import get_localzone
 
-SEARCH_MODEL = "gemini/gemini-1.5-pro-002"
+SEARCH_MODEL = "gemini/gemini-1.5-flash-002"
 COMMANDS_MODEL_VOICE = "gemini/gemini-1.5-pro-002"
 COMMANDS_MODEL_TEXT = "gemini/gemini-1.5-pro-002"
 # COMMANDS_MODEL_TEXT = "openai/gpt-4o"
 
+class FallbacksModels:
+    """Fallback models for LLM completion requests."""
+    SearchFallbacks = "openai/gpt-4o-mini"
+    CommandsFallbacks = "gemini/gemini-1.5-flash-002"
+
 import os
 from dotenv import load_dotenv
 
+class BotStates:
+    """States for the conversation handler."""
+    PARSE_INPUT = 1
+    CONFIRMATION = 2
 
 class Config:
     """Configuration management using environment variables."""
@@ -39,7 +48,6 @@ class Config:
 from abc import ABC, abstractmethod
 from telegram import Update
 from telegram.ext import CallbackContext
-
 
 class BaseHandler(ABC):
     """Abstract base class for all handlers."""
@@ -93,9 +101,9 @@ class RescheduleDetails(BaseModel):
     new_timezone: Optional[str] = Field(None, description="New IANA timezone string")
 
 class RelevantEventResponse(BaseModel):
-    event_id: Optional[str] = Field(None, description="The id of the most relevant event")
-    event_name: Optional[str] = Field(None, description="The name (summary) of the most relevant event")
-    uncertain: bool = Field(False, description="True if uncertain, false if confident")
+    event_id: str = Field(..., description="The id of the most relevant event")
+    event_name: str = Field(..., description="The name (summary) of the most relevant event")
+    uncertain_match: bool = Field(..., description="True if uncertain, false if confident")
 
 
 class GoogleCalendarService:
@@ -171,7 +179,7 @@ class GoogleCalendarService:
         self.logger.debug(f"Created event: {created_event}")
         return created_event
 
-    def delete_event(self, event_text: str, user_id: int) -> Dict:
+    def delete_event(self, event_text: str, user_id: int, update: Update) -> Dict:
         """Deletes an event from Google Calendar based on identifier using LLM for relevance."""
         creds = self.get_credentials(user_id)
         service = build('calendar', 'v3', credentials=creds)
@@ -180,24 +188,26 @@ class GoogleCalendarService:
         now = datetime.utcnow().isoformat() + 'Z'  # 'Z' indicates UTC time
         events_result = service.events().list(
             calendarId='primary', timeMin=now,
-            maxResults=50, singleEvents=True,
+            maxResults=20, singleEvents=True,
             orderBy='startTime').execute()
         events = events_result.get('items', [])
+
+        update.message.reply_text(f"Searching in {len(events)} events for the most relevant one...")
 
         # Utilize LLM to find the most relevant event based on identifier
         relevant_event = self.find_relevant_event_with_llm(event_text, events)
         if relevant_event:
-            if relevant_event.uncertain:
+            if relevant_event.uncertain_match:
                 self.logger.debug("LLM is not sure about the event. Awaiting user confirmation.")
                 return {"status": "requires_confirmation", "event": relevant_event}
-            event_id = relevant_event['id']
+            event_id = relevant_event.event_id
             service.events().delete(calendarId='primary', eventId=event_id).execute()
             self.logger.debug(f"Deleted event: {relevant_event}")
             return {"status": "deleted", "event": relevant_event}
         self.logger.debug("No matching event found to delete.")
         return {"status": "not_found"}
 
-    def reschedule_event(self, details: Dict, user_id: int) -> Dict:
+    def reschedule_event(self, details: Dict, user_id: int, update: Update) -> Dict:
         """Reschedules an existing event based on identifier and new details using LLM for relevance."""
         identifier = details.get('identifier')
         new_date = details.get('new_date')
@@ -211,19 +221,21 @@ class GoogleCalendarService:
         now = datetime.utcnow().isoformat() + 'Z'  # 'Z' indicates UTC time
         events_result = service.events().list(
             calendarId='primary', timeMin=now,
-            maxResults=50, singleEvents=True,
+            maxResults=20, singleEvents=True,
             orderBy='startTime').execute()
         events = events_result.get('items', [])
+
+        update.message.reply_text(f"Searching in {len(events)} events for the most relevant one...")
 
         # Utilize LLM to find the most relevant event based on identifier
         relevant_event = self.find_relevant_event_with_llm(identifier, events)
         if relevant_event:
-            if relevant_event.uncertain:
+            if relevant_event.uncertain_match:
                 # Indicate uncertainty
                 self.logger.debug("LLM is not sure about the event. Awaiting user confirmation.")
                 return {"status": "requires_confirmation", "event": relevant_event}
 
-            event_id = relevant_event['id']
+            event_id = relevant_event.event_id
             # Update event details
             if new_date and new_time and new_timezone:
                 start_datetime_str = f"{new_date} {new_time}"
@@ -236,13 +248,19 @@ class GoogleCalendarService:
                 start_datetime = pytz.timezone(new_timezone).localize(start_datetime)
                 end_datetime = start_datetime + timedelta(hours=1)  # Default duration
 
-                relevant_event['start']['dateTime'] = start_datetime.isoformat()
-                relevant_event['start']['timeZone'] = new_timezone
-                relevant_event['end']['dateTime'] = end_datetime.isoformat()
-                relevant_event['end']['timeZone'] = new_timezone
+                new_event = {
+                    'start': {
+                        'dateTime': start_datetime.isoformat(),
+                        'timeZone': new_timezone,
+                    },
+                    'end': {
+                        'dateTime': end_datetime.isoformat(),
+                        'timeZone': new_timezone,
+                    },
+                }
 
                 updated_event = service.events().update(
-                    calendarId='primary', eventId=event_id, body=relevant_event).execute()
+                    calendarId='primary', eventId=event_id, body=new_event).execute()
                 self.logger.debug(f"Rescheduled event: {updated_event}")
                 return {"status": "rescheduled", "event": updated_event}
         self.logger.debug("No matching event found to reschedule.")
@@ -298,23 +316,15 @@ class GoogleCalendarService:
         
         5. If you are confident about a match, prepare to output the event's id and name.
         
-        6. If you are not sure which event is being referred to, or if there are multiple possible matches with no clear best option, set the 'uncertain' flag to true.
+        6. If you are not sure which event is being referred to, or if there are multiple possible matches with no clear best option, set the 'uncertain_match' flag to true.
+        """ + """
         
         Provide your answer in JSON format with the following structure:
         <answer>
         {
           "event_id": "The id of the most relevant event",
           "event_name": "The name (summary) of the most relevant event",
-          "uncertain": boolean (true if uncertain, false if confident)
-        }
-        </answer>
-        
-        If you are not sure, your output should look like this:
-        <answer>
-        {
-          "event_id": null,
-          "event_name": null,
-          "uncertain": false
+          "uncertain_match": boolean (true if uncertain, false if confident)
         }
         </answer>
         
@@ -326,19 +336,21 @@ class GoogleCalendarService:
             {"role": "user", "content": "Process the following event text and find the most relevant event."},
         ]
 
-        try:
-            chosen_event = litellm.completion(
-                model=SEARCH_MODEL,
-                messages=messages,
-                tools=[],
-                temperature=0, # IT'S VERY IMPORTANT TO SET TEMPERATURE TO 0.
-                response_format=RelevantEventResponse
-            )
-            self.logger.debug(f"LLM chose event: {chosen_event}")
-            return chosen_event
-        except Exception as e:
-            self.logger.error(f"Error in LLM for finding relevant event: {e}")
-        return None
+        # Enable instructor patches
+        response = litellm.completion(
+            model=SEARCH_MODEL,
+            messages=messages,
+            temperature=0, # IT'S VERY IMPORTANT TO SET TEMPERATURE TO 0.
+            response_format=RelevantEventResponse,
+            retries=3,
+            fallbacks=[FallbacksModels.SearchFallbacks]
+        )
+        response_content = response['choices'][0]['message']['content']
+        response_data = json.loads(response_content)
+        matched_event = RelevantEventResponse(**response_data)
+
+        self.logger.debug(f"LLM chose event: {matched_event}")
+        return matched_event
 
 
 class LiteLLMService:
@@ -413,7 +425,9 @@ class LiteLLMService:
             messages=messages,
             tools=self.functions,  # Pass the function schemas
             tool_choice=tool_choice,
-            temperature=0 # IT'S VERY IMPORTANT TO SET TEMPERATURE TO 0.
+            temperature=0, # IT'S VERY IMPORTANT TO SET TEMPERATURE TO 0.
+            retries=3,
+            fallbacks=[FallbacksModels.CommandsFallbacks]
         )
         return response
 
@@ -421,13 +435,27 @@ class LiteLLMService:
         """Extract function calls from the model response."""
         return response_message.get('tool_calls', [])
 
-    def execute_function(self, function_name: str, function_args: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    def execute_function(self, function_name: str, function_args: Dict[str, Any], user_id: int, update: Update) -> Dict[str, Any]:
         """Map function calls to GoogleCalendarService methods."""
         self.logger.debug(f"Executing function '{function_name}' with args: {function_args}")
         im_not_sure = function_args.get('im_not_sure', False)
-        if im_not_sure:
-            return {"status": "requires_confirmation"}
 
+        # Define action_info based on the function
+        if function_name == "add_event":
+            action_info = f"Adding a new event: {function_args.get('name')} on {function_args.get('date')} at {function_args.get('time')} ({function_args.get('timezone')})"
+        elif function_name == "delete_event":
+            action_info = f"Deleting an event identified by: {function_args.get('event_text')}"
+        elif function_name == "reschedule_event":
+            action_info = f"Rescheduling an event identified by: {function_args.get('event_text')} to {function_args.get('new_date')} at {function_args.get('new_time')} ({function_args.get('new_timezone')})"
+        else:
+            action_info = "Performing an unknown action."
+
+        if im_not_sure:
+            return {"status": "requires_confirmation", "action_info": action_info}
+        else:
+            update.message.reply_text(f"{action_info}")
+
+        # Proceed to execute the function
         if function_name == "add_event":
             try:
                 event = CalendarEvent(**function_args)
@@ -440,7 +468,7 @@ class LiteLLMService:
         elif function_name == "delete_event":
             try:
                 identifier = EventIdentifier(**function_args)
-                result = self.google_calendar_service.delete_event(identifier.event_text, user_id)
+                result = self.google_calendar_service.delete_event(identifier.event_text, user_id, update)
                 return result
             except Exception as e:
                 self.logger.error(f"Error in delete_event: {e}")
@@ -448,7 +476,7 @@ class LiteLLMService:
         elif function_name == "reschedule_event":
             try:
                 details = RescheduleDetails(**function_args)
-                result = self.google_calendar_service.reschedule_event(details.model_dump(), user_id)
+                result = self.google_calendar_service.reschedule_event(details.model_dump(), user_id, update)
                 return result
             except Exception as e:
                 self.logger.error(f"Error in reschedule_event: {e}")
@@ -475,8 +503,8 @@ class InputHandler(BaseHandler):
         # Inform the user that the message is being processed
         update.message.reply_text("Processing your request...")
 
-        # Extract text from message.text or message.caption
-        user_message = message.text_markdown_v2_urled if message.text_markdown_urled else message.caption_markdown_v2_urled
+        # Extract user message
+        user_message = message.text or message.caption
         self.logger.debug(f"Extracted user message: {user_message}")
 
         if not user_message and not message.voice and not message.audio:
@@ -530,7 +558,7 @@ class InputHandler(BaseHandler):
                             "text": "Please process the following audio message and perform commands. Audio language: Russian"
                         },
                         {
-                            "type": "image_url", # IT"S A HACK FROM LiteLLM's DOCS. IT'S 100% WORKING.
+                            "type": "image_url", # IT'S A HACK FROM LiteLLM's DOCS. IT'S 100% WORKING.
                             "image_url": "data:audio/ogg;base64,{}".format(encoded_audio),
                         }
                     ],
@@ -565,67 +593,59 @@ class InputHandler(BaseHandler):
                     self.logger.debug(f"Function call detected: {function_name} with args: {function_args}")
 
                     # Execute the function using LiteLLMService
-                    result = self.litellm_service.execute_function(function_name, function_args, user_id)
+                    result = self.litellm_service.execute_function(function_name, function_args, user_id, update)
+
+                    # Send action info to the user
+                    action_info = result.get("action_info")
+                    if action_info:
+                        update.message.reply_text(f"About to perform: {action_info}")
 
                     # Check if confirmation is required
                     if result.get("status") == "requires_confirmation":
-                        event = result.get("event")
-                        if event:
-                            context.user_data['pending_action'] = {
-                                "function_name": function_name,
-                                "function_args": function_args,
-                                "event": event
-                            }
-                            update.message.reply_text(
-                                f"I found an event that might match your request: {event.get('summary', 'No Title')} on {event.get('start', {}).get('dateTime', 'Unknown Time')}. "
-                                f"Do you want to proceed with this action?"
-                            )
-                            return 'CONFIRMATION'
-                    else:
+                        update.message.reply_text("Do you want to proceed with this action? (Yes/No)")
                         context.user_data['pending_action'] = {
                             "function_name": function_name,
                             "function_args": function_args
                         }
-                        update.message.reply_text(f"I am about to perform an action {function_name} with args {function_args}. Do you want to proceed?")
-                        return 'CONFIRMATION'
-
-
-                    # Send the result back to the user
-                    if 'error' in result:
-                        update.message.reply_text(f"Error: {result['error']}")
+                        return BotStates.CONFIRMATION
                     else:
-                        if result.get("status") == "deleted":
-                            event_name = result.get("event", {}).get('summary', 'the event')
-                            event_time = result.get("event", {}).get('start', {}).get('dateTime', 'the specified time')
-                            update.message.reply_text(
-                                f"I have deleted the event '{event_name}' scheduled at '{event_time}'."
-                            )
-                        elif result.get("status") == "rescheduled":
-                            event = result.get("event", {})
-                            event_name = event.get('summary', 'the event')
-                            new_time = event.get('start', {}).get('dateTime', 'the new specified time')
-                            update.message.reply_text(
-                                f"The event '{event_name}' has been rescheduled to '{new_time}'."
-                            )
-                        elif result.get("status") == "added":
-                            event = result.get("event", {})
-                            event_name = event.get('summary', 'the event')
-                            event_time = event.get('start', {}).get('dateTime', 'the specified time')
-                            event_link = event.get("htmlLink")
-                            context.user_data['last_added_event'] = event
-                            update.message.reply_text(
-                                f"Event '{event_name}' has been added on '{event_time}'. "
-                                f"You can view it here: {event_link}" if event_link else "Event added successfully."
-                            )
-
-                return ConversationHandler.END
+                        # Action does not require confirmation; execute and inform the user
+                        if 'error' in result:
+                            update.message.reply_text(f"Error: {result['error']}")
+                        else:
+                            # Send appropriate success messages
+                            if result.get("status") == "deleted":
+                                event_name = result.get("event", {}).get('summary', 'the event')
+                                event_time = result.get("event", {}).get('start', {}).get('dateTime',
+                                                                                          'the specified time')
+                                update.message.reply_text(
+                                    f"I have deleted the event '{event_name}' scheduled at '{event_time}'."
+                                )
+                            elif result.get("status") == "rescheduled":
+                                event = result.get("event", {})
+                                event_name = event.get('summary', 'the event')
+                                new_time = event.get('start', {}).get('dateTime', 'the new specified time')
+                                update.message.reply_text(
+                                    f"The event '{event_name}' has been rescheduled to '{new_time}'."
+                                )
+                            elif result.get("status") == "added":
+                                event = result.get("event", {})
+                                event_name = event.get('summary', 'the event')
+                                event_time = event.get('start', {}).get('dateTime', 'the specified time')
+                                event_link = event.get("htmlLink")
+                                context.user_data['last_added_event'] = event
+                                reply_text = f"Event '{event_name}' has been added on '{event_time}'."
+                                if event_link:
+                                    reply_text += f" You can view it here: {event_link}"
+                                update.message.reply_text(reply_text)
+                return BotStates.PARSE_INPUT
             else:
                 update.message.reply_text("Sorry, I couldn't understand the request. Please try again.")
                 return ConversationHandler.END
 
         except Exception as e:
             self.logger.error(f"Error with LiteLLM completion: {e}")
-            update.message.reply_text("An error occurred while processing your request.")
+            update.message.reply_text(f"An error occurred while processing your request.\n{e}")
             return ConversationHandler.END
 
 
@@ -651,10 +671,12 @@ class ConfirmationHandler(BaseHandler):
         if response in ['yes', 'y']:
             function_name = pending_action['function_name']
             function_args = pending_action['function_args']
-            event = pending_action['event']
+
+            # Inform the user that the action is being executed
+            update.message.reply_text(f"Proceeding with '{function_name}' action.")
 
             # Execute the function now that user has confirmed
-            result = self.litellm_service.execute_function(function_name, function_args, user_id)
+            result = self.litellm_service.execute_function(function_name, function_args, user_id, update)
 
             if 'error' in result:
                 update.message.reply_text(f"Error: {result['error']}")
@@ -678,14 +700,15 @@ class ConfirmationHandler(BaseHandler):
                     event_time = event.get('start', {}).get('dateTime', 'the specified time')
                     event_link = event.get("htmlLink")
                     context.user_data['last_added_event'] = event
-                    update.message.reply_text(
-                        f"Event '{event_name}' has been added on '{event_time}'. "
-                        f"You can view it here: {event_link}" if event_link else "Event added successfully."
-                    )
+                    reply_text = f"Event '{event_name}' has been added on '{event_time}'."
+                    if event_link:
+                        reply_text += f" You can view it here: {event_link}"
+                    update.message.reply_text(reply_text)
 
             # Clear the pending action
             context.user_data.pop('pending_action', None)
             return ConversationHandler.END
+
         elif response in ['no', 'n']:
             update.message.reply_text("Okay, action has been cancelled.")
             # Clear the pending action
@@ -693,7 +716,7 @@ class ConfirmationHandler(BaseHandler):
             return ConversationHandler.END
         else:
             update.message.reply_text("Please respond with 'Yes' or 'No'. Do you want to proceed with this action?")
-            return 'CONFIRMATION'
+            return BotStates.CONFIRMATION
 
 
 from telegram import Update, ReplyKeyboardRemove
