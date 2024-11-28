@@ -29,7 +29,7 @@ def main():
     # Initialize handlers
     start_handler = StartHandler(logger)
     input_handler = InputHandler(logger, litellm_service, google_calendar_service)
-    confirmation_handler = ConfirmationHandler(logger, google_calendar_service)
+    confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service)
     cancel_handler = CancelHandler(logger)
 
     # Define conversation states
