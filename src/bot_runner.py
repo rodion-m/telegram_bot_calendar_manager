@@ -1,4 +1,4 @@
-# bot.py
+# bot_runner.py
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -7,16 +7,8 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-from config import Config
-from logging_setup import LoggerSetup
-from services.google_calendar_service import GoogleCalendarService
-from services.litellm_service import LiteLLMService
-from handlers.start_handler import StartHandler
-from handlers.input_handler import InputHandler
-from handlers.confirmation_handler import ConfirmationHandler
-from handlers.cancel_handler import CancelHandler
-from src.handlers.input_handler_gemini import InputHandlerGemini
-from src.services.google_genai_service import GoogleGenAIService
+from src.logic import Config, LoggerSetup, GoogleCalendarService, LiteLLMService, StartHandler, ConfirmationHandler, \
+    InputHandler, CancelHandler
 
 
 def main():
@@ -28,7 +20,7 @@ def main():
 
     # Initialize services
     google_calendar_service = GoogleCalendarService(config, logger)
-    google_genai_service = GoogleGenAIService(api_key=config.GEMINI_API_KEY, logger=logger)
+    litellm_service = LiteLLMService(config, logger, google_calendar_service)
 
     # Initialize Telegram bot
     updater = Updater(config.TELEGRAM_TOKEN, use_context=True)
@@ -36,7 +28,7 @@ def main():
 
     # Initialize handlers
     start_handler = StartHandler(logger)
-    input_handler = InputHandlerGemini(logger, google_genai_service, google_calendar_service)
+    input_handler = InputHandler(logger, litellm_service, google_calendar_service)
     confirmation_handler = ConfirmationHandler(logger, google_calendar_service)
     cancel_handler = CancelHandler(logger)
 
