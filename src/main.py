@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler
 
 from src.logic import Config, LoggerSetup, GoogleCalendarService, LiteLLMService, StartHandler, ConfirmationHandler, \
-    InputHandler, CancelHandler, BotStates
+    InputHandler, CancelHandler, BotStates, FirestoreService
 
 # Initialize configuration
 config = Config()
@@ -17,7 +17,8 @@ config = Config()
 logger = LoggerSetup.setup_logging()
 
 # Initialize services
-google_calendar_service = GoogleCalendarService(config, logger)
+firestore_service: FirestoreService = FirestoreService(config)
+google_calendar_service = GoogleCalendarService(config, logger, firestore_service)
 litellm_service = LiteLLMService(config, logger, google_calendar_service)
 
 # Initialize Telegram bot
@@ -26,8 +27,8 @@ dispatcher = updater.dispatcher
 
 # Initialize handlers
 start_handler = StartHandler(logger)
-input_handler = InputHandler(logger, litellm_service, google_calendar_service)
-confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service)
+input_handler = InputHandler(logger, litellm_service, google_calendar_service, firestore_service)
+confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service, firestore_service)
 cancel_handler = CancelHandler(logger)
 
 # Define the conversation handler with states PARSE_INPUT and CONFIRMATION
@@ -70,7 +71,7 @@ def webhook():
     except Exception as e:
         logger.error(f"Error in webhook: {e}")
         sentry_sdk.capture_exception(e)
-        return "An error occurred while processing the update.", 500
+        return "OK"
 
 @app.route('/google_callback')
 def google_callback():
@@ -92,7 +93,7 @@ def google_callback():
     except Exception as e:
         logger.error(f"Error in Google callback: {e}")
         sentry_sdk.capture_exception(e)
-        return "Authorization failed! Please try again.", 500
+        return "Authorization failed! Please try again.", 200
 
 
 def run_local():

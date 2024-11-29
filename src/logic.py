@@ -9,7 +9,6 @@ from typing import Dict, Any, List, Optional, Union
 
 import litellm
 import pytz
-import requests
 import telegram
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -25,6 +24,8 @@ import os
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
+
+from google.cloud import firestore
 
 # Constants
 SEARCH_MODEL = "gemini/gemini-1.5-flash-002"
@@ -65,8 +66,9 @@ class Config:
         self.SENTRY_DSN = os.getenv("SENTRY_DSN")
         self.ENV = os.getenv("ENV", "local")
 
-        # Google Tokens Path
-        self.TOKENS_PATH: str = os.getenv("GOOGLE_TOKENS_PATH", "google_tokens")
+        # Firestore configuration
+        self.FIRESTORE_PROJECT = os.getenv("FIRESTORE_PROJECT")
+        self.FIRESTORE_COLLECTION = os.getenv("FIRESTORE_COLLECTION", "google_access_tokens")
 
         # Initialize Sentry SDK for production
         sentry_logging = LoggingIntegration(
@@ -82,12 +84,64 @@ class Config:
         logging.getLogger(__name__).info("Sentry SDK initialized.")
 
 
+class FirestoreService:
+    """Service to interact with Firestore for storing tokens and user state."""
+
+    def __init__(self, config: Config):
+        # the creds are given by the role "Cloud Datastore User" in https://console.cloud.google.com/iam-admin/iam
+        self.client = firestore.Client(project=config.FIRESTORE_PROJECT)
+        self.collection = config.FIRESTORE_COLLECTION
+
+    def get_user_document(self, user_id: int) -> firestore.DocumentReference:
+        """Get a reference to the user's document."""
+        return self.client.collection(self.collection).document(str(user_id))
+
+    # Token Operations
+    def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
+        """Save OAuth tokens to Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.set({"tokens": tokens}, merge=True)
+
+    def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieve OAuth tokens from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        doc = user_doc.get()
+        if doc.exists:
+            return doc.to_dict().get("tokens")
+        return None
+
+    def delete_tokens(self, user_id: int) -> None:
+        """Delete OAuth tokens from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.update({"tokens": firestore.DELETE_FIELD})
+
+    # User State Operations
+    def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
+        """Save user state to Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.set({"state": state}, merge=True)
+
+    def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieve user state from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        doc = user_doc.get()
+        if doc.exists:
+            return doc.to_dict().get("state")
+        return None
+
+    def delete_user_state(self, user_id: int) -> None:
+        """Delete user state from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.update({"state": firestore.DELETE_FIELD})
+
+
 class BaseHandler(ABC):
     """Abstract base class for all handlers."""
 
     @abstractmethod
     def handle(self, update: Update, context: CallbackContext) -> Union[int, None]:
         pass
+
 
 def download_audio_in_memory(message: Message, user_id: int, logger: logging.Logger) -> bytes:
     """Downloads audio from a Telegram message into RAM."""
@@ -107,6 +161,7 @@ def download_audio_in_memory(message: Message, user_id: int, logger: logging.Log
     return bytes(audio_bytes)
 
 
+# Pydantic Models
 class CalendarEvent(BaseModel):
     name: str = Field(..., description="Name of the event")
     date: str = Field(..., description="Date of the event in YYYY-MM-DD format")
@@ -140,10 +195,11 @@ class RelevantEventResponse(BaseModel):
 class GoogleCalendarService:
     """Service to interact with Google Calendar API."""
 
-    def __init__(self, config: Config, logger: logging.Logger):
+    def __init__(self, config: Config, logger: logging.Logger, firestore_service: FirestoreService):
         self.config = config
         self.logger = logger
         self.SCOPES = self.config.SCOPES
+        self.firestore_service = firestore_service
 
     def generate_auth_url(self, user_id: int) -> str:
         """Generates the OAuth 2.0 authorization URL for the user."""
@@ -173,9 +229,8 @@ class GoogleCalendarService:
 
         return authorization_url
 
-    def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials:
+    def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials | None:
         """Gets or refreshes credentials for a user."""
-        token_path = os.path.join(self.config.TOKENS_PATH, f'token_{user_id}.json')
         creds = None
 
         if authorization_code:
@@ -201,18 +256,21 @@ class GoogleCalendarService:
 
             creds = flow.credentials
 
-            # Save credentials to file
-            with open(token_path, 'w') as token_file:
-                token_file.write(creds.to_json())
-        elif os.path.exists(token_path):
-            creds = Credentials.from_authorized_user_file(token_path, self.SCOPES)
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                # Save the refreshed credentials
-                with open(token_path, 'w') as token_file:
-                    token_file.write(creds.to_json())
+            # Save credentials to Firestore
+            self.firestore_service.save_tokens(user_id, json.loads(creds.to_json()))
+
         else:
-            raise Exception("Authorization code required for new users.")
+            tokens = self.firestore_service.get_tokens(user_id)
+            if tokens:
+                creds = Credentials.from_authorized_user_info(info=tokens, scopes=self.SCOPES)
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                    # Save the refreshed credentials
+
+                    # Convert JSON string to dictionary before saving
+                    self.firestore_service.save_tokens(user_id, json.loads(creds.to_json()))
+            else:
+                return None
 
         return creds
 
@@ -472,7 +530,6 @@ class GoogleCalendarService:
             sentry_sdk.capture_exception(e)
             return None
 
-
 class LiteLLMService:
     """Service to interact with LiteLLM for function calling."""
 
@@ -610,42 +667,40 @@ class InputHandler(BaseHandler):
     """Handler for parsing user input."""
 
     def __init__(self, logger: logging.Logger, litellm_service: LiteLLMService,
-                 google_calendar_service: GoogleCalendarService):
+                 google_calendar_service: GoogleCalendarService, firestore_service: FirestoreService):
         self.logger = logger
         self.litellm_service = litellm_service
         self.google_calendar_service = google_calendar_service
+        self.firestore_service = firestore_service
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="InputHandler.handle") as transaction:
+
+            self.logger.debug("Input handler triggered")
+            user = update.effective_user
+            user_id: int = user.id
+
+            # Set Sentry user context
+            sentry_sdk.set_user({"id": user_id, "username": user.username, "first_name": user.first_name})
+
+            # Check if user has valid credentials
             try:
-                self.logger.debug("Input handler triggered")
-                user = update.effective_user
-                user_id: int = user.id
-
-                # Set Sentry user context
-                sentry_sdk.set_user({"id": user_id, "username": user.username, "first_name": user.first_name})
-
-                # Check if user has valid credentials
-                try:
-                    creds = self.google_calendar_service.get_credentials(user_id)
-                    if not creds or not creds.valid:
-                        # Generate auth URL and prompt user
-                        auth_url = self.google_calendar_service.generate_auth_url(user_id)
-                        update.message.reply_text(
-                            "You need to authorize access to your Google Calendar. Please click the link below to authorize:",
-                            reply_markup=telegram.InlineKeyboardMarkup([
-                                [telegram.InlineKeyboardButton("Authorize", url=auth_url)]
-                            ])
-                        )
-                except Exception as e:
-                    sentry_sdk.capture_exception(e)
-                    update.message.reply_text("Please authorize the bot to access your Google Calendar.")
+                creds = self.google_calendar_service.get_credentials(user_id)
+                if not creds or not creds.valid:
+                    # Generate auth URL and prompt user
+                    auth_url = self.google_calendar_service.generate_auth_url(user_id)
+                    update.message.reply_text(
+                        "You need to authorize access to your Google Calendar. Please click the link below to authorize:",
+                        reply_markup=telegram.InlineKeyboardMarkup([
+                            [telegram.InlineKeyboardButton("Authorize", url=auth_url)]
+                        ])
+                    )
                     return ConversationHandler.END
 
                 # Inform the user that the message is being processed
                 update.message.reply_text("Processing your request...")
 
-                # Extract user message
+                # IT'S 100% RIGHT TO USE update.message.text_markdown_v2_urled INSTEAD OF update.message.text_markdown_v2.
                 user_message: Optional[str] = update.message.text_markdown_v2_urled or update.message.caption_markdown_v2_urled
                 self.logger.debug(f"Extracted user message: {user_message}")
 
@@ -680,7 +735,6 @@ class InputHandler(BaseHandler):
                     # Handle voice or audio messages: download and transcribe
                     audio_bytes = download_audio_in_memory(update.message, user_id, self.logger)
                     encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
-
                     messages = [
                         {"role": "system", "content": system_prompt},
                         {
@@ -740,10 +794,14 @@ class InputHandler(BaseHandler):
                                 if event:
                                     update.message.reply_text(f"Found event: {event.event_name}")
                                 update.message.reply_text("Do you want to proceed with this action? (Yes/No)")
-                                context.user_data['pending_action'] = {
+
+                                # Save pending action to Firestore
+                                pending_action = {
                                     "function_name": function_name,
                                     "function_args": function_args
                                 }
+                                self.firestore_service.save_user_state(user_id, {"pending_action": pending_action})
+
                                 return BotStates.CONFIRMATION
                             elif result.get("status") == "not_found":
                                 update.message.reply_text("Sorry, I couldn't find the event. Please try again.")
@@ -797,10 +855,11 @@ class ConfirmationHandler(BaseHandler):
     """Handler for confirming event actions when LLM is unsure."""
 
     def __init__(self, logger: logging.Logger, litellm_service: LiteLLMService,
-                 google_calendar_service: GoogleCalendarService):
+                 google_calendar_service: GoogleCalendarService, firestore_service: FirestoreService):
         self.logger = logger
         self.litellm_service = litellm_service
         self.google_calendar_service = google_calendar_service
+        self.firestore_service = firestore_service
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="ConfirmationHandler.handle") as transaction:
@@ -812,22 +871,26 @@ class ConfirmationHandler(BaseHandler):
                 # Set Sentry user context
                 sentry_sdk.set_user({"id": user_id})
 
-                pending_action: Optional[Dict[str, Any]] = context.user_data.get('pending_action')
-                if not pending_action:
+                # Retrieve pending action from Firestore
+                user_state = self.firestore_service.get_user_state(user_id)
+                if not user_state or "pending_action" not in user_state:
                     update.message.reply_text("No pending actions to confirm.")
                     return ConversationHandler.END
 
-                if response in ['yes', 'y']:
+                pending_action = user_state["pending_action"]
+
+                if response in ['yes', 'y', 'да', 'д']:
                     function_name: str = pending_action['function_name']
                     function_args: Dict[str, Any] = pending_action['function_args']
 
                     # Inform the user that the action is being executed
                     update.message.reply_text(f"Proceeding with '{function_name}' action.")
 
-                    # Execute the function now that user has confirmed
+                    # Execute the function using LiteLLMService
                     result: Dict[str, Any] = self.litellm_service.execute_function(function_name, function_args, user_id,
                                                                                    update)
 
+                    # Handle the result
                     if result.get("status") == "error":
                         update.message.reply_text(f"Error: {result.get('error')}")
                     else:
@@ -857,14 +920,14 @@ class ConfirmationHandler(BaseHandler):
                                 reply_text += f" You can view it here: {event_link}"
                             update.message.reply_text(reply_text)
 
-                    # Clear the pending action
-                    context.user_data.pop('pending_action', None)
+                    # Clear the pending action from Firestore
+                    self.firestore_service.delete_user_state(user_id)
                     return ConversationHandler.END
 
-                elif response in ['no', 'n']:
+                elif response in ['no', 'n', 'нет', 'н']:
                     update.message.reply_text("Okay, action has been cancelled.")
-                    # Clear the pending action
-                    context.user_data.pop('pending_action', None)
+                    # Clear the pending action from Firestore
+                    self.firestore_service.delete_user_state(user_id)
                     return ConversationHandler.END
                 else:
                     update.message.reply_text("Please respond with 'Yes' or 'No'. Do you want to proceed with this action?")
