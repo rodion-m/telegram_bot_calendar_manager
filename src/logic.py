@@ -1,3 +1,5 @@
+# logic.py
+
 import base64
 import datetime
 import json
@@ -7,9 +9,11 @@ from typing import Dict, Any, List, Optional, Union
 
 import litellm
 import pytz
+import requests
+import telegram
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from pydantic import BaseModel, Field
 from tzlocal import get_localzone
@@ -18,7 +22,6 @@ from abc import ABC, abstractmethod
 from telegram import Update, Message, ReplyKeyboardRemove
 from telegram.ext import CallbackContext, ConversationHandler
 import os
-from dotenv import load_dotenv
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -47,30 +50,36 @@ class Config:
     """Configuration management using environment variables."""
 
     def __init__(self, env_file: str = ".env"):
-        load_dotenv(env_file)
-        self.GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
-        self.OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
-        self.TELEGRAM_TOKEN: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.LITELLM_LOG: str = os.getenv("LITELLM_LOG", "INFO")
-        self.SCOPES: List[str] = ['https://www.googleapis.com/auth/calendar.events']
-        self.CREDENTIALS_FILE: str = os.getenv("GOOGLE_CREDENTIALS_FILE", "../google_credentials.json")
-        self.SENTRY_DSN: Optional[str] = os.getenv("SENTRY_DSN")
+        # Load environment variables from .env in local development
+        if os.getenv("ENV", "local") == "local":
+            from dotenv import load_dotenv
+            load_dotenv(env_file)
 
-        # Initialize Sentry SDK
-        if self.SENTRY_DSN:
-            sentry_logging = LoggingIntegration(
-                level=logging.INFO,        # Capture info and above as breadcrumbs
-                event_level=logging.ERROR  # Send errors as events
-            )
-            sentry_sdk.init(
-                dsn=self.SENTRY_DSN,
-                integrations=[sentry_logging],
-                traces_sample_rate=1.0,   # Capture 100% of transactions for performance monitoring
-                profiles_sample_rate=1.0  # Profile 100% of sampled transactions
-            )
-            logging.getLogger(__name__).info("Sentry SDK initialized.")
-        else:
-            logging.getLogger(__name__).warning("SENTRY_DSN not found. Sentry SDK not initialized.")
+        self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        self.TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+        self.GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+        self.GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+        self.SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+        self.SENTRY_DSN = os.getenv("SENTRY_DSN")
+        self.ENV = os.getenv("ENV", "local")
+
+        # Google Tokens Path
+        self.TOKENS_PATH: str = os.getenv("GOOGLE_TOKENS_PATH", "google_tokens")
+
+        # Initialize Sentry SDK for production
+        sentry_logging = LoggingIntegration(
+            level=logging.INFO,        # Capture info and above as breadcrumbs
+            event_level=logging.ERROR  # Send errors as events
+        )
+        sentry_sdk.init(
+            dsn=self.SENTRY_DSN,
+            integrations=[sentry_logging],
+            traces_sample_rate=1.0,
+            profiles_sample_rate=1.0  # Profile 100% of sampled transactions
+        )
+        logging.getLogger(__name__).info("Sentry SDK initialized.")
 
 
 class BaseHandler(ABC):
@@ -80,26 +89,22 @@ class BaseHandler(ABC):
     def handle(self, update: Update, context: CallbackContext) -> Union[int, None]:
         pass
 
+def download_audio_in_memory(message: Message, user_id: int, logger: logging.Logger) -> bytes:
+    """Downloads audio from a Telegram message into RAM."""
+    if message.voice:
+        file = message.voice.get_file()
+        mime_type = message.voice.mime_type
+    elif message.audio:
+        file = message.audio.get_file()
+        mime_type = message.audio.mime_type
+    else:
+        raise ValueError("Message does not contain audio or voice data.")
 
-def download_audio(message: Message, user_id: int, logger: logging.Logger) -> Optional[str]:
-    """Downloads audio from a Telegram message."""
-    try:
-        if message.voice:
-            file = message.voice.get_file()
-            audio_path = f"audio_{user_id}.ogg"
-        elif message.audio:
-            file = message.audio.get_file()
-            audio_extension = message.audio.mime_type.split('/')[-1]
-            audio_path = f"audio_{user_id}.{audio_extension}"
-        else:
-            return None
-        file.download(audio_path)
-        logger.debug(f"Downloaded audio to {audio_path}")
-        return audio_path
-    except Exception as e:
-        logger.error(f"Failed to download audio: {e}")
-        sentry_sdk.capture_exception(e)
-        return None
+    # Download the file as bytes
+    audio_bytes = file.download_as_bytearray()
+    logger.debug(f"Downloaded audio for user {user_id}, MIME type: {mime_type}")
+
+    return bytes(audio_bytes)
 
 
 class CalendarEvent(BaseModel):
@@ -140,23 +145,75 @@ class GoogleCalendarService:
         self.logger = logger
         self.SCOPES = self.config.SCOPES
 
-    def get_credentials(self, user_id: int) -> Credentials:
-        creds: Optional[Credentials] = None
-        # Create tokens directory if it doesn't exist
-        if not os.path.exists('../google_tokens'):
-            os.makedirs('../google_tokens')
-        token_path = f'../google_tokens/token_{user_id}.json'  # Unique token file per user
-        if os.path.exists(token_path):
+    def generate_auth_url(self, user_id: int) -> str:
+        """Generates the OAuth 2.0 authorization URL for the user."""
+        client_config = {
+            "web": {
+                "client_id": self.config.GOOGLE_CLIENT_ID,
+                "client_secret": self.config.GOOGLE_CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [self.config.GOOGLE_REDIRECT_URI],
+            }
+        }
+
+        flow = Flow.from_client_config(
+            client_config=client_config,
+            scopes=self.SCOPES,
+            redirect_uri=self.config.GOOGLE_REDIRECT_URI
+        )
+
+        # Embed user_id in state for mapping after callback
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            state=str(user_id),  # TODO: Encrypt with JWT for security
+            prompt='consent'  # Forces consent screen to ensure refresh_token is received
+        )
+
+        return authorization_url
+
+    def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials:
+        """Gets or refreshes credentials for a user."""
+        token_path = os.path.join(self.config.TOKENS_PATH, f'token_{user_id}.json')
+        creds = None
+
+        if authorization_code:
+            # Initialize Flow with client_config and scopes
+            client_config = {
+                "web": {
+                    "client_id": self.config.GOOGLE_CLIENT_ID,
+                    "client_secret": self.config.GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [self.config.GOOGLE_REDIRECT_URI],
+                }
+            }
+
+            flow = Flow.from_client_config(
+                client_config=client_config,
+                scopes=self.SCOPES,
+                redirect_uri=self.config.GOOGLE_REDIRECT_URI
+            )
+
+            # Fetch token using authorization_code
+            flow.fetch_token(code=authorization_code)
+
+            creds = flow.credentials
+
+            # Save credentials to file
+            with open(token_path, 'w') as token_file:
+                token_file.write(creds.to_json())
+        elif os.path.exists(token_path):
             creds = Credentials.from_authorized_user_file(token_path, self.SCOPES)
-        if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.config.CREDENTIALS_FILE, self.SCOPES)
-                creds = flow.run_local_server(port=0)
-            with open(token_path, 'w') as token:
-                token.write(creds.to_json())
+                # Save the refreshed credentials
+                with open(token_path, 'w') as token_file:
+                    token_file.write(creds.to_json())
+        else:
+            raise Exception("Authorization code required for new users.")
+
         return creds
 
     def create_event(self, event: CalendarEvent, user_id: int) -> Dict[str, Any]:
@@ -568,6 +625,23 @@ class InputHandler(BaseHandler):
                 # Set Sentry user context
                 sentry_sdk.set_user({"id": user_id, "username": user.username, "first_name": user.first_name})
 
+                # Check if user has valid credentials
+                try:
+                    creds = self.google_calendar_service.get_credentials(user_id)
+                    if not creds or not creds.valid:
+                        # Generate auth URL and prompt user
+                        auth_url = self.google_calendar_service.generate_auth_url(user_id)
+                        update.message.reply_text(
+                            "You need to authorize access to your Google Calendar. Please click the link below to authorize:",
+                            reply_markup=telegram.InlineKeyboardMarkup([
+                                [telegram.InlineKeyboardButton("Authorize", url=auth_url)]
+                            ])
+                        )
+                except Exception as e:
+                    sentry_sdk.capture_exception(e)
+                    update.message.reply_text("Please authorize the bot to access your Google Calendar.")
+                    return ConversationHandler.END
+
                 # Inform the user that the message is being processed
                 update.message.reply_text("Processing your request...")
 
@@ -604,19 +678,8 @@ class InputHandler(BaseHandler):
                 is_voice = bool(update.message.voice or update.message.audio)
                 if is_voice:
                     # Handle voice or audio messages: download and transcribe
-                    audio_path = download_audio(update.message, user_id, self.logger)
-                    if not audio_path:
-                        update.message.reply_text("Failed to download audio.")
-                        return ConversationHandler.END
-
-                    # Read and encode the audio file
-                    with open(audio_path, "rb") as f:
-                        audio_bytes = f.read()
+                    audio_bytes = download_audio_in_memory(update.message, user_id, self.logger)
                     encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
-                    self.logger.debug("Encoded audio to base64")
-
-                    # Remove the audio file after encoding
-                    os.remove(audio_path)
 
                     messages = [
                         {"role": "system", "content": system_prompt},
