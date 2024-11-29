@@ -11,7 +11,7 @@ from src.logic import Config, LoggerSetup, GoogleCalendarService, LiteLLMService
     InputHandler, CancelHandler, BotStates
 
 config = Config()
-logger = LoggerSetup.setup_logging()
+logger = LoggerSetup.setup_logging(config.LOGGING_MIN_LEVEL)
 
 # Initialize repository based on environment
 repository = config.get_repository()

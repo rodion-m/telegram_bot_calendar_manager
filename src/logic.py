@@ -197,6 +197,7 @@ class Config:
         self.SCOPES = ['https://www.googleapis.com/auth/calendar.events']
         self.SENTRY_DSN = os.getenv("SENTRY_DSN")
         self.ENV = os.getenv("ENV", "local")
+        self.LOGGING_MIN_LEVEL = os.getenv("LOGGING_MIN_LEVEL", "INFO")
 
         # Firestore configuration
         self.FIRESTORE_PROJECT = os.getenv("FIRESTORE_PROJECT")
@@ -859,7 +860,8 @@ class InputHandler(BaseHandler):
                     )
 
                     self.logger.info(f"LLM Response:\n{response}")
-                    response_message: Dict[str, Any] = response.get('choices', [{}])[0].get('message', {})
+                    # IT'S 100% RIGHT TO USE response['choices'][0]['message'].
+                    response_message = response['choices'][0]['message']
                     tool_calls: List[Dict[str, Any]] = self.litellm_service.parse_function_calls(response_message)
 
                     if tool_calls:
