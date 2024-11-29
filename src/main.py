@@ -8,17 +8,18 @@ from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler
 
 from src.logic import Config, LoggerSetup, GoogleCalendarService, LiteLLMService, StartHandler, ConfirmationHandler, \
-    InputHandler, CancelHandler, BotStates, FirestoreService
+    InputHandler, CancelHandler, BotStates
 
-# Setup logging
+config = Config()
 logger = LoggerSetup.setup_logging()
 
-# Initialize configuration
-config = Config()
+# Initialize repository based on environment
+repository = config.get_repository()
 
-# Initialize services
-firestore_service: FirestoreService = FirestoreService(config)
-google_calendar_service = GoogleCalendarService(config, logger, firestore_service)
+# Initialize Google Calendar Service
+google_calendar_service = GoogleCalendarService(config, logger, repository)
+
+# Initialize LiteLLM Service
 litellm_service = LiteLLMService(config, logger, google_calendar_service)
 
 # Initialize Telegram bot
@@ -27,8 +28,8 @@ dispatcher = updater.dispatcher
 
 # Initialize handlers
 start_handler = StartHandler(logger)
-input_handler = InputHandler(logger, litellm_service, google_calendar_service, firestore_service)
-confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service, firestore_service)
+input_handler = InputHandler(logger, litellm_service, google_calendar_service, repository)
+confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service, repository)
 cancel_handler = CancelHandler(logger)
 
 # Define the conversation handler with states PARSE_INPUT and CONFIRMATION

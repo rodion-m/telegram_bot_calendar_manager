@@ -4,6 +4,8 @@ import base64
 import datetime
 import json
 import logging
+import os
+from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union
 
@@ -17,14 +19,11 @@ from googleapiclient.discovery import build
 from pydantic import BaseModel, Field
 from tzlocal import get_localzone
 
-from abc import ABC, abstractmethod
 from telegram import Update, Message, ReplyKeyboardRemove
 from telegram.ext import CallbackContext, ConversationHandler
-import os
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
-
 from google.cloud import firestore
 
 # Constants
@@ -34,6 +33,7 @@ COMMANDS_MODEL_TEXT = "gemini/gemini-1.5-flash-002"
 # COMMANDS_MODEL_TEXT = "openai/gpt-4o"
 
 # TODO: Reimplement reschedule_event feature, cause it's complex
+
 
 class FallbacksModels:
     """Fallback models for LLM completion requests."""
@@ -45,6 +45,138 @@ class BotStates:
     """States for the conversation handler."""
     PARSE_INPUT = 1
     CONFIRMATION = 2
+
+
+class IRepository(ABC):
+    """Repository interface for managing tokens and user state."""
+
+    @abstractmethod
+    def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
+        pass
+
+    @abstractmethod
+    def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def delete_tokens(self, user_id: int) -> None:
+        pass
+
+    @abstractmethod
+    def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
+        pass
+
+    @abstractmethod
+    def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def delete_user_state(self, user_id: int) -> None:
+        pass
+
+
+class FirestoreRepository(IRepository):
+    """Repository implementation using Google Firestore."""
+
+    def __init__(self, config: 'Config'):
+        self.client = firestore.Client()
+        self.collection = config.FIRESTORE_COLLECTION
+
+    def get_user_document(self, user_id: int) -> firestore.DocumentReference:
+        """Get a reference to the user's document."""
+        return self.client.collection(self.collection).document(str(user_id))
+
+    def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
+        """Save OAuth tokens to Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.set({"tokens": tokens}, merge=True)
+
+    def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieve OAuth tokens from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        doc = user_doc.get()
+        if doc.exists:
+            return doc.to_dict().get("tokens")
+        return None
+
+    def delete_tokens(self, user_id: int) -> None:
+        """Delete OAuth tokens from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.update({"tokens": firestore.DELETE_FIELD})
+
+    def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
+        """Save user state to Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.set({"state": state}, merge=True)
+
+    def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieve user state from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        doc = user_doc.get()
+        if doc.exists:
+            return doc.to_dict().get("state")
+        return None
+
+    def delete_user_state(self, user_id: int) -> None:
+        """Delete user state from Firestore."""
+        user_doc = self.get_user_document(user_id)
+        user_doc.update({"state": firestore.DELETE_FIELD})
+
+
+class FileSystemRepository(IRepository):
+    """Repository implementation using the local filesystem."""
+
+    def __init__(self, config: 'Config'):
+        self.token_dir = os.path.abspath("../google_tokens")
+        os.makedirs(self.token_dir, exist_ok=True)
+
+    def _get_token_path(self, user_id: int) -> str:
+        return os.path.join(self.token_dir, f"token_{user_id}.json")
+
+    def _get_state_path(self, user_id: int) -> str:
+        return os.path.join(self.token_dir, f"state_{user_id}.json")
+
+    def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
+        path = self._get_token_path(user_id)
+        with open(path, 'w') as f:
+            json.dump(tokens, f)
+        logging.info(f"Saved tokens for user {user_id} to {path}")
+
+    def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
+        path = self._get_token_path(user_id)
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                tokens = json.load(f)
+            logging.info(f"Retrieved tokens for user {user_id} from {path}")
+            return tokens
+        return None
+
+    def delete_tokens(self, user_id: int) -> None:
+        path = self._get_token_path(user_id)
+        if os.path.exists(path):
+            os.remove(path)
+            logging.info(f"Deleted tokens for user {user_id} from {path}")
+
+    def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
+        path = self._get_state_path(user_id)
+        with open(path, 'w') as f:
+            json.dump(state, f)
+        logging.info(f"Saved user state for user {user_id} to {path}")
+
+    def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+        path = self._get_state_path(user_id)
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                state = json.load(f)
+            logging.info(f"Retrieved user state for user {user_id} from {path}")
+            return state
+        return None
+
+    def delete_user_state(self, user_id: int) -> None:
+        path = self._get_state_path(user_id)
+        if os.path.exists(path):
+            os.remove(path)
+            logging.info(f"Deleted user state for user {user_id} from {path}")
 
 
 class Config:
@@ -83,56 +215,14 @@ class Config:
         )
         logging.getLogger(__name__).info("Sentry SDK initialized.")
 
-
-class FirestoreService:
-    """Service to interact with Firestore for storing tokens and user state."""
-
-    def __init__(self, config: Config):
-        # the creds are given by the role "Cloud Datastore User" in https://console.cloud.google.com/iam-admin/iam
-        self.client = firestore.Client()
-        self.collection = config.FIRESTORE_COLLECTION
-
-    def get_user_document(self, user_id: int) -> firestore.DocumentReference:
-        """Get a reference to the user's document."""
-        return self.client.collection(self.collection).document(str(user_id))
-
-    # Token Operations
-    def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
-        """Save OAuth tokens to Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.set({"tokens": tokens}, merge=True)
-
-    def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Retrieve OAuth tokens from Firestore."""
-        user_doc = self.get_user_document(user_id)
-        doc = user_doc.get()
-        if doc.exists:
-            return doc.to_dict().get("tokens")
-        return None
-
-    def delete_tokens(self, user_id: int) -> None:
-        """Delete OAuth tokens from Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.update({"tokens": firestore.DELETE_FIELD})
-
-    # User State Operations
-    def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
-        """Save user state to Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.set({"state": state}, merge=True)
-
-    def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Retrieve user state from Firestore."""
-        user_doc = self.get_user_document(user_id)
-        doc = user_doc.get()
-        if doc.exists:
-            return doc.to_dict().get("state")
-        return None
-
-    def delete_user_state(self, user_id: int) -> None:
-        """Delete user state from Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.update({"state": firestore.DELETE_FIELD})
+    def get_repository(self) -> IRepository:
+        """Returns the appropriate repository based on the environment."""
+        if self.ENV == "local":
+            logging.info("Using FileSystemRepository for local environment.")
+            return FileSystemRepository(self)
+        else:
+            logging.info("Using FirestoreRepository for production environment.")
+            return FirestoreRepository(self)
 
 
 class BaseHandler(ABC):
@@ -195,11 +285,11 @@ class RelevantEventResponse(BaseModel):
 class GoogleCalendarService:
     """Service to interact with Google Calendar API."""
 
-    def __init__(self, config: Config, logger: logging.Logger, firestore_service: FirestoreService):
+    def __init__(self, config: Config, logger: logging.Logger, repository: IRepository):
         self.config = config
         self.logger = logger
         self.SCOPES = self.config.SCOPES
-        self.firestore_service = firestore_service
+        self.repository = repository
 
     def generate_auth_url(self, user_id: int) -> str:
         """Generates the OAuth 2.0 authorization URL for the user."""
@@ -256,11 +346,11 @@ class GoogleCalendarService:
 
             creds = flow.credentials
 
-            # Save credentials to Firestore
-            self.firestore_service.save_tokens(user_id, json.loads(creds.to_json()))
+            # Save credentials using the repository
+            self.repository.save_tokens(user_id, json.loads(creds.to_json()))
 
         else:
-            tokens = self.firestore_service.get_tokens(user_id)
+            tokens = self.repository.get_tokens(user_id)
             if tokens:
                 creds = Credentials.from_authorized_user_info(info=tokens, scopes=self.SCOPES)
                 if creds and creds.expired and creds.refresh_token:
@@ -268,7 +358,7 @@ class GoogleCalendarService:
                     # Save the refreshed credentials
 
                     # Convert JSON string to dictionary before saving
-                    self.firestore_service.save_tokens(user_id, json.loads(creds.to_json()))
+                    self.repository.save_tokens(user_id, json.loads(creds.to_json()))
             else:
                 return None
 
@@ -530,6 +620,7 @@ class GoogleCalendarService:
             sentry_sdk.capture_exception(e)
             return None
 
+
 class LiteLLMService:
     """Service to interact with LiteLLM for function calling."""
 
@@ -667,11 +758,11 @@ class InputHandler(BaseHandler):
     """Handler for parsing user input."""
 
     def __init__(self, logger: logging.Logger, litellm_service: LiteLLMService,
-                 google_calendar_service: GoogleCalendarService, firestore_service: FirestoreService):
+                 google_calendar_service: GoogleCalendarService, repository: IRepository):
         self.logger = logger
         self.litellm_service = litellm_service
         self.google_calendar_service = google_calendar_service
-        self.firestore_service = firestore_service
+        self.repository = repository
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="InputHandler.handle") as transaction:
@@ -795,12 +886,12 @@ class InputHandler(BaseHandler):
                                     update.message.reply_text(f"Found event: {event.event_name}")
                                 update.message.reply_text("Do you want to proceed with this action? (Yes/No)")
 
-                                # Save pending action to Firestore
+                                # Save pending action to the repository
                                 pending_action = {
                                     "function_name": function_name,
                                     "function_args": function_args
                                 }
-                                self.firestore_service.save_user_state(user_id, {"pending_action": pending_action})
+                                self.repository.save_user_state(user_id, {"pending_action": pending_action})
 
                                 return BotStates.CONFIRMATION
                             elif result.get("status") == "not_found":
@@ -855,11 +946,11 @@ class ConfirmationHandler(BaseHandler):
     """Handler for confirming event actions when LLM is unsure."""
 
     def __init__(self, logger: logging.Logger, litellm_service: LiteLLMService,
-                 google_calendar_service: GoogleCalendarService, firestore_service: FirestoreService):
+                 google_calendar_service: GoogleCalendarService, repository: IRepository):
         self.logger = logger
         self.litellm_service = litellm_service
         self.google_calendar_service = google_calendar_service
-        self.firestore_service = firestore_service
+        self.repository = repository
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="ConfirmationHandler.handle") as transaction:
@@ -871,8 +962,8 @@ class ConfirmationHandler(BaseHandler):
                 # Set Sentry user context
                 sentry_sdk.set_user({"id": user_id})
 
-                # Retrieve pending action from Firestore
-                user_state = self.firestore_service.get_user_state(user_id)
+                # Retrieve pending action from the repository
+                user_state = self.repository.get_user_state(user_id)
                 if not user_state or "pending_action" not in user_state:
                     update.message.reply_text("No pending actions to confirm.")
                     return ConversationHandler.END
@@ -920,14 +1011,14 @@ class ConfirmationHandler(BaseHandler):
                                 reply_text += f" You can view it here: {event_link}"
                             update.message.reply_text(reply_text)
 
-                    # Clear the pending action from Firestore
-                    self.firestore_service.delete_user_state(user_id)
+                    # Clear the pending action from the repository
+                    self.repository.delete_user_state(user_id)
                     return ConversationHandler.END
 
                 elif response in ['no', 'n', 'нет', 'н']:
                     update.message.reply_text("Okay, action has been cancelled.")
-                    # Clear the pending action from Firestore
-                    self.firestore_service.delete_user_state(user_id)
+                    # Clear the pending action from the repository
+                    self.repository.delete_user_state(user_id)
                     return ConversationHandler.END
                 else:
                     update.message.reply_text("Please respond with 'Yes' or 'No'. Do you want to proceed with this action?")
@@ -990,7 +1081,7 @@ class LoggerSetup:
     def setup_logging(level: str = "INFO") -> logging.Logger:
         logging.basicConfig(
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            level=getattr(logging, level.upper(), logging.info)
+            level=getattr(logging, level.upper(), logging.INFO)
         )
         logger = logging.getLogger(__name__)
         return logger
