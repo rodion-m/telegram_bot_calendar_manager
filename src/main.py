@@ -10,11 +10,11 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Conve
 from src.logic import Config, LoggerSetup, GoogleCalendarService, LiteLLMService, StartHandler, ConfirmationHandler, \
     InputHandler, CancelHandler, BotStates, FirestoreService
 
-# Initialize configuration
-config = Config()
-
 # Setup logging
 logger = LoggerSetup.setup_logging()
+
+# Initialize configuration
+config = Config()
 
 # Initialize services
 firestore_service: FirestoreService = FirestoreService(config)

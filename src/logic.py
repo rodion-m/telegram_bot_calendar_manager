@@ -29,8 +29,8 @@ from google.cloud import firestore
 
 # Constants
 SEARCH_MODEL = "gemini/gemini-1.5-flash-002"
-COMMANDS_MODEL_VOICE = "gemini/gemini-1.5-pro-002"
-COMMANDS_MODEL_TEXT = "gemini/gemini-1.5-pro-002"
+COMMANDS_MODEL_VOICE = "gemini/gemini-1.5-flash-002"
+COMMANDS_MODEL_TEXT = "gemini/gemini-1.5-flash-002"
 # COMMANDS_MODEL_TEXT = "openai/gpt-4o"
 
 # TODO: Reimplement reschedule_event feature, cause it's complex
@@ -89,7 +89,7 @@ class FirestoreService:
 
     def __init__(self, config: Config):
         # the creds are given by the role "Cloud Datastore User" in https://console.cloud.google.com/iam-admin/iam
-        self.client = firestore.Client(project=config.FIRESTORE_PROJECT)
+        self.client = firestore.Client()
         self.collection = config.FIRESTORE_COLLECTION
 
     def get_user_document(self, user_id: int) -> firestore.DocumentReference:
@@ -156,7 +156,7 @@ def download_audio_in_memory(message: Message, user_id: int, logger: logging.Log
 
     # Download the file as bytes
     audio_bytes = file.download_as_bytearray()
-    logger.debug(f"Downloaded audio for user {user_id}, MIME type: {mime_type}")
+    logger.info(f"Downloaded audio for user {user_id}, MIME type: {mime_type}")
 
     return bytes(audio_bytes)
 
@@ -320,7 +320,7 @@ class GoogleCalendarService:
                         event_body['description'] = f"Connection Info: " + event.connection_info.replace("\\n", " ")
 
                 created_event = service.events().insert(calendarId='primary', body=event_body).execute()
-                self.logger.debug(f"Created event: {created_event}")
+                self.logger.info(f"Created event: {created_event}")
                 return created_event
             except Exception as e:
                 self.logger.error(f"Failed to create event: {e}")
@@ -343,7 +343,7 @@ class GoogleCalendarService:
                 events = events_result.get('items', [])
 
                 if len(events) == 0:
-                    self.logger.debug("No events found in the calendar.")
+                    self.logger.info("No events found in the calendar.")
                     return {"status": "not_found"}
 
                 update.message.reply_text(f"Searching in {len(events)} events for the most relevant one...")
@@ -353,16 +353,16 @@ class GoogleCalendarService:
 
                 if not relevant_event or not relevant_event.found_something:
                     # TODO: Retry with more maxResults value
-                    self.logger.debug("LLM did not find anything relevant.")
+                    self.logger.info("LLM did not find anything relevant.")
                     return {"status": "not_found"}
 
                 if relevant_event.uncertain_match:
-                    self.logger.debug("LLM is not sure about the event. Awaiting user confirmation.")
+                    self.logger.info("LLM is not sure about the event. Awaiting user confirmation.")
                     return {"status": "requires_confirmation", "event": relevant_event}
 
                 event_id = relevant_event.event_id
                 service.events().delete(calendarId='primary', eventId=event_id).execute()
-                self.logger.debug(f"Deleted event: {relevant_event}")
+                self.logger.info(f"Deleted event: {relevant_event}")
                 return {"status": "deleted", "event": relevant_event}
             except Exception as e:
                 self.logger.error(f"Failed to delete event: {e}")
@@ -390,7 +390,7 @@ class GoogleCalendarService:
                 events = events_result.get('items', [])
 
                 if len(events) == 0:
-                    self.logger.debug("No events found in the calendar.")
+                    self.logger.info("No events found in the calendar.")
                     return {"status": "not_found"}
 
                 update.message.reply_text(f"Searching in {len(events)} events for the most relevant one...")
@@ -400,11 +400,11 @@ class GoogleCalendarService:
 
                 if not relevant_event or not relevant_event.found_something:
                     # TODO: Retry with more maxResults value
-                    self.logger.debug("LLM did not find anything relevant.")
+                    self.logger.info("LLM did not find anything relevant.")
                     return {"status": "not_found"}
 
                 if relevant_event.uncertain_match:
-                    self.logger.debug("LLM is not sure about the event. Awaiting user confirmation.")
+                    self.logger.info("LLM is not sure about the event. Awaiting user confirmation.")
                     return {"status": "requires_confirmation", "event": relevant_event}
 
                 event_id = relevant_event.event_id
@@ -429,7 +429,7 @@ class GoogleCalendarService:
 
                 updated_event = service.events().update(
                     calendarId='primary', eventId=event_id, body=new_event).execute()
-                self.logger.debug(f"Rescheduled event: {updated_event}")
+                self.logger.info(f"Rescheduled event: {updated_event}")
                 return {"status": "rescheduled", "event": updated_event}
             except Exception as e:
                 self.logger.error(f"Failed to reschedule event: {e}")
@@ -440,7 +440,7 @@ class GoogleCalendarService:
         RelevantEventResponse]:
         """Use LLM to determine the most relevant event based on the identifier."""
         if not events:
-            self.logger.debug("No events found in the calendar.")
+            self.logger.info("No events found in the calendar.")
             return None
 
         events_list_json = {
@@ -523,7 +523,7 @@ class GoogleCalendarService:
             response_data: Dict[str, Any] = json.loads(response_content)
             matched_event: RelevantEventResponse = RelevantEventResponse(**response_data)
 
-            self.logger.debug(f"LLM chose event: {matched_event}")
+            self.logger.info(f"LLM chose event: {matched_event}")
             return matched_event
         except Exception as e:
             self.logger.error(f"LLM failed to find a relevant event: {e}")
@@ -621,7 +621,7 @@ class LiteLLMService:
     def execute_function(self, function_name: str, function_args: Dict[str, Any], user_id: int, update: Update) -> Dict[
         str, Any]:
         """Map function calls to GoogleCalendarService methods."""
-        self.logger.debug(f"Executing function '{function_name}' with args: {function_args}")
+        self.logger.info(f"Executing function '{function_name}' with args: {function_args}")
         im_not_sure: bool = function_args.get('im_not_sure', False)
 
         # Define action_info based on the function
@@ -644,7 +644,7 @@ class LiteLLMService:
             if function_name == "add_event":
                 event = CalendarEvent(**function_args)
                 result = self.google_calendar_service.create_event(event, user_id)
-                self.logger.debug(f"Event added: {result}")
+                self.logger.info(f"Event added: {result}")
                 return {"status": "added", "event": result}
             elif function_name == "delete_event":
                 identifier = EventIdentifier(**function_args)
@@ -676,7 +676,7 @@ class InputHandler(BaseHandler):
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="InputHandler.handle") as transaction:
 
-            self.logger.debug("Input handler triggered")
+            self.logger.info("Input handler triggered")
             user = update.effective_user
             user_id: int = user.id
 
@@ -702,7 +702,7 @@ class InputHandler(BaseHandler):
 
                 # IT'S 100% RIGHT TO USE update.message.text_markdown_v2_urled INSTEAD OF update.message.text_markdown_v2.
                 user_message: Optional[str] = update.message.text_markdown_v2_urled or update.message.caption_markdown_v2_urled
-                self.logger.debug(f"Extracted user message: {user_message}")
+                self.logger.info(f"Extracted user message: {user_message}")
 
                 if not user_message and not update.message.voice and not update.message.audio:
                     update.message.reply_text("Unsupported message type. Please send text, audio, or voice messages.")
@@ -753,7 +753,7 @@ class InputHandler(BaseHandler):
                     ]
                 else:
                     # Handle text or caption messages
-                    self.logger.debug(f"Received text/caption message: {user_message}")
+                    self.logger.info(f"Received text/caption message: {user_message}")
                     messages = [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message},
@@ -767,7 +767,7 @@ class InputHandler(BaseHandler):
                         tool_choice="auto",
                     )
 
-                    self.logger.debug(f"LLM Response:\n{response}")
+                    self.logger.info(f"LLM Response:\n{response}")
                     response_message: Dict[str, Any] = response.get('choices', [{}])[0].get('message', {})
                     tool_calls: List[Dict[str, Any]] = self.litellm_service.parse_function_calls(response_message)
 
@@ -777,7 +777,7 @@ class InputHandler(BaseHandler):
                             function_name: str = tool_call['function']['name']
                             function_args: Dict[str, Any] = json.loads(tool_call['function']['arguments'])
 
-                            self.logger.debug(f"Function call detected: {function_name} with args: {function_args}")
+                            self.logger.info(f"Function call detected: {function_name} with args: {function_args}")
 
                             # Execute the function using LiteLLMService
                             result: Dict[str, Any] = self.litellm_service.execute_function(function_name, function_args,
@@ -864,7 +864,7 @@ class ConfirmationHandler(BaseHandler):
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="ConfirmationHandler.handle") as transaction:
             try:
-                self.logger.debug("Confirmation handler triggered")
+                self.logger.info("Confirmation handler triggered")
                 response: str = update.message.text.lower()
                 user_id: int = update.effective_user.id
 
@@ -948,7 +948,7 @@ class CancelHandler(BaseHandler):
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         try:
-            self.logger.debug("Cancel handler triggered")
+            self.logger.info("Cancel handler triggered")
             update.message.reply_text("Operation cancelled.", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
         except Exception as e:
@@ -966,7 +966,7 @@ class StartHandler(BaseHandler):
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         try:
-            self.logger.debug("Start command received")
+            self.logger.info("Start command received")
             update.message.reply_text(
                 "Hi! I can help you manage your Google Calendar events.\n\n"
                 "You can:\n"
@@ -987,10 +987,10 @@ class LoggerSetup:
     """Sets up the logging configuration."""
 
     @staticmethod
-    def setup_logging(level: str = "DEBUG") -> logging.Logger:
+    def setup_logging(level: str = "INFO") -> logging.Logger:
         logging.basicConfig(
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            level=getattr(logging, level.upper(), logging.DEBUG)
+            level=getattr(logging, level.upper(), logging.info)
         )
         logger = logging.getLogger(__name__)
         return logger
