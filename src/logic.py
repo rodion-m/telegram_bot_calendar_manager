@@ -30,18 +30,22 @@ from google.cloud import firestore
 SEARCH_MODEL = "gemini/gemini-1.5-flash-002"
 COMMANDS_MODEL_VOICE = "gemini/gemini-1.5-flash-002"
 COMMANDS_MODEL_TEXT = "gemini/gemini-1.5-flash-002"
+# COMMANDS_MODEL_TEXT = "openai/gpt-4o"
 
 # TODO: Reimplement reschedule_event feature, cause it's complex
+
 
 class FallbacksModels:
     """Fallback models for LLM completion requests."""
     SearchFallbacks = "openai/gpt-4o-mini"
     CommandsFallbacks = "gemini/gemini-1.5-flash-002"
 
+
 class BotStates:
     """States for the conversation handler."""
     PARSE_INPUT = 1
     CONFIRMATION = 2
+
 
 class IRepository(ABC):
     """Repository interface for managing tokens and user state."""
@@ -70,11 +74,12 @@ class IRepository(ABC):
     def delete_user_state(self, user_id: int) -> None:
         pass
 
+
 class FirestoreRepository(IRepository):
     """Repository implementation using Google Firestore."""
 
     def __init__(self, config: 'Config'):
-        self.client = firestore.Client(project=config.FIRESTORE_PROJECT)
+        self.client = firestore.Client()
         self.collection = config.FIRESTORE_COLLECTION
 
     def get_user_document(self, user_id: int) -> firestore.DocumentReference:
@@ -85,47 +90,38 @@ class FirestoreRepository(IRepository):
         """Save OAuth tokens to Firestore."""
         user_doc = self.get_user_document(user_id)
         user_doc.set({"tokens": tokens}, merge=True)
-        logging.info(f"Saved tokens for user {user_id} to Firestore.")
 
     def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve OAuth tokens from Firestore."""
         user_doc = self.get_user_document(user_id)
         doc = user_doc.get()
         if doc.exists:
-            tokens = doc.to_dict().get("tokens")
-            logging.info(f"Retrieved tokens for user {user_id} from Firestore.")
-            return tokens
-        logging.info(f"No tokens found for user {user_id} in Firestore.")
+            return doc.to_dict().get("tokens")
         return None
 
     def delete_tokens(self, user_id: int) -> None:
         """Delete OAuth tokens from Firestore."""
         user_doc = self.get_user_document(user_id)
         user_doc.update({"tokens": firestore.DELETE_FIELD})
-        logging.info(f"Deleted tokens for user {user_id} from Firestore.")
 
     def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
         """Save user state to Firestore."""
         user_doc = self.get_user_document(user_id)
         user_doc.set({"state": state}, merge=True)
-        logging.info(f"Saved user state for user {user_id} to Firestore.")
 
     def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve user state from Firestore."""
         user_doc = self.get_user_document(user_id)
         doc = user_doc.get()
         if doc.exists:
-            state = doc.to_dict().get("state")
-            logging.info(f"Retrieved user state for user {user_id} from Firestore.")
-            return state
-        logging.info(f"No user state found for user {user_id} in Firestore.")
+            return doc.to_dict().get("state")
         return None
 
     def delete_user_state(self, user_id: int) -> None:
         """Delete user state from Firestore."""
         user_doc = self.get_user_document(user_id)
         user_doc.update({"state": firestore.DELETE_FIELD})
-        logging.info(f"Deleted user state for user {user_id} from Firestore.")
+
 
 class FileSystemRepository(IRepository):
     """Repository implementation using the local filesystem."""
@@ -153,7 +149,6 @@ class FileSystemRepository(IRepository):
                 tokens = json.load(f)
             logging.info(f"Retrieved tokens for user {user_id} from {path}")
             return tokens
-        logging.info(f"No tokens found for user {user_id} in filesystem.")
         return None
 
     def delete_tokens(self, user_id: int) -> None:
@@ -175,7 +170,6 @@ class FileSystemRepository(IRepository):
                 state = json.load(f)
             logging.info(f"Retrieved user state for user {user_id} from {path}")
             return state
-        logging.info(f"No user state found for user {user_id} in filesystem.")
         return None
 
     def delete_user_state(self, user_id: int) -> None:
@@ -183,6 +177,7 @@ class FileSystemRepository(IRepository):
         if os.path.exists(path):
             os.remove(path)
             logging.info(f"Deleted user state for user {user_id} from {path}")
+
 
 class Config:
     """Configuration management using environment variables."""
@@ -230,12 +225,14 @@ class Config:
             logging.info("Using FirestoreRepository for production environment.")
             return FirestoreRepository(self)
 
+
 class BaseHandler(ABC):
     """Abstract base class for all handlers."""
 
     @abstractmethod
     def handle(self, update: Update, context: CallbackContext) -> Union[int, None]:
         pass
+
 
 def download_audio_in_memory(message: Message, user_id: int, logger: logging.Logger) -> bytes:
     """Downloads audio from a Telegram message into RAM."""
@@ -254,6 +251,7 @@ def download_audio_in_memory(message: Message, user_id: int, logger: logging.Log
 
     return bytes(audio_bytes)
 
+
 # Pydantic Models
 class CalendarEvent(BaseModel):
     name: str = Field(..., description="Name of the event")
@@ -264,9 +262,11 @@ class CalendarEvent(BaseModel):
     connection_info: Optional[str] = Field(None,
                                            description="Connection information for the event, such as links and passwords")
 
+
 class EventIdentifier(BaseModel):
     event_text: str = Field(...,
                             description="Info to identify the event to delete. All info that helps to identify the event in one string.")
+
 
 class RescheduleDetails(BaseModel):
     event_text: str = Field(...,
@@ -275,11 +275,13 @@ class RescheduleDetails(BaseModel):
     new_time: Optional[str] = Field(None, description="New time in HH:MM (24-hour) format")
     new_timezone: Optional[str] = Field(None, description="New IANA timezone string")
 
+
 class RelevantEventResponse(BaseModel):
     found_something: bool = Field(..., description="True if the model found something possibly relevant")
     event_id: str = Field(..., description="The id of the most relevant event. Empty string if no match found.")
     event_name: str = Field(..., description="The name (summary) of the most relevant event. Empty string if no match found.")
     uncertain_match: bool = Field(..., description="True if uncertain or match is ambiguous, false if confident")
+
 
 class GoogleCalendarService:
     """Service to interact with Google Calendar API."""
@@ -355,6 +357,8 @@ class GoogleCalendarService:
                 if creds and creds.expired and creds.refresh_token:
                     creds.refresh(Request())
                     # Save the refreshed credentials
+
+                    # Convert JSON string to dictionary before saving
                     self.repository.save_tokens(user_id, json.loads(creds.to_json()))
             else:
                 return None
@@ -500,6 +504,8 @@ class GoogleCalendarService:
                 start_datetime = datetime.strptime(start_datetime_str, "%Y-%m-%d %H:%M")
                 start_datetime = pytz.timezone(new_timezone).localize(start_datetime)
                 end_datetime = start_datetime + timedelta(hours=1)  # Default duration
+                if not new_timezone:
+                    new_timezone = str(get_localzone())
 
                 new_event: Dict[str, Any] = {
                     'start': {
@@ -521,7 +527,8 @@ class GoogleCalendarService:
                 sentry_sdk.capture_exception(e)
                 return {"status": "error", "error": str(e)}
 
-    def find_relevant_event_with_llm(self, event_text: str, events: List[Dict[str, Any]]) -> Optional[RelevantEventResponse]:
+    def find_relevant_event_with_llm(self, event_text: str, events: List[Dict[str, Any]]) -> Optional[
+        RelevantEventResponse]:
         """Use LLM to determine the most relevant event based on the identifier."""
         if not events:
             self.logger.info("No events found in the calendar.")
@@ -538,6 +545,7 @@ class GoogleCalendarService:
                     "end": event.get("end", "Unknown"),
                     "created": event.get("created", "Unknown"),
                     "updated": event.get("updated", "Unknown"),
+                    # "creator": event.get("creator", "Unknown"),
                 }
                 for event in events
             ]
@@ -612,6 +620,7 @@ class GoogleCalendarService:
             self.logger.error(f"LLM failed to find a relevant event: {e}")
             sentry_sdk.capture_exception(e)
             return None
+
 
 class LiteLLMService:
     """Service to interact with LiteLLM for function calling."""
@@ -701,7 +710,8 @@ class LiteLLMService:
         """Extract function calls from the model response."""
         return response_message.get('tool_calls', [])
 
-    def execute_function(self, function_name: str, function_args: Dict[str, Any], user_id: int, update: Update) -> Dict[str, Any]:
+    def execute_function(self, function_name: str, function_args: Dict[str, Any], user_id: int, update: Update) -> Dict[
+        str, Any]:
         """Map function calls to GoogleCalendarService methods."""
         self.logger.info(f"Executing function '{function_name}' with args: {function_args}")
         im_not_sure: bool = function_args.get('im_not_sure', False)
@@ -743,6 +753,7 @@ class LiteLLMService:
             self.logger.error(f"Error executing function '{function_name}': {e}")
             sentry_sdk.capture_exception(e)
             return {"status": "error", "error": str(e)}
+
 
 class InputHandler(BaseHandler):
     """Handler for parsing user input."""
@@ -932,6 +943,7 @@ class InputHandler(BaseHandler):
                 update.message.reply_text(f"An unexpected error occurred.\n{e}")
                 return ConversationHandler.END
 
+
 class ConfirmationHandler(BaseHandler):
     """Handler for confirming event actions when LLM is unsure."""
 
@@ -1020,6 +1032,7 @@ class ConfirmationHandler(BaseHandler):
                 update.message.reply_text(f"An unexpected error occurred.\n{e}")
                 return ConversationHandler.END
 
+
 class CancelHandler(BaseHandler):
     """Handler for the /cancel command."""
 
@@ -1036,6 +1049,7 @@ class CancelHandler(BaseHandler):
             sentry_sdk.capture_exception(e)
             update.message.reply_text(f"An error occurred while cancelling the operation.\n{e}")
             return ConversationHandler.END
+
 
 class StartHandler(BaseHandler):
     """Handler for the /start command."""
@@ -1060,6 +1074,7 @@ class StartHandler(BaseHandler):
             sentry_sdk.capture_exception(e)
             update.message.reply_text(f"An error occurred while starting the bot.\n{e}")
             return ConversationHandler.END
+
 
 class LoggerSetup:
     """Sets up the logging configuration."""
