@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Union, Generator
 
 from contextlib import contextmanager
 
+import aioboto3
 import litellm
 import pytz
 import telegram
@@ -29,7 +30,6 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
-from google.cloud import firestore
 from loguru import logger
 
 # Constants
@@ -121,14 +121,83 @@ class IRepository(ABC):
     async def delete_user_state(self, user_id: int) -> None:
         pass
 
+class DynamoDbRepository(IRepository):
+    """Repository implementation using Amazon DynamoDB."""
+
+    def __init__(self, table_name: str = 'google-telegram-planner', region_name: str = 'eu-north-1'):
+        self.table_name = table_name
+        self.region_name = region_name
+
+    async def get_user_item(self, user_id: int) -> Dict[str, Any]:
+        """Construct the primary key for the user's item."""
+        return {'user_id': {'N': str(user_id)}}
+
+    async def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
+        """Save OAuth tokens to DynamoDB."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            item = await self.get_user_item(user_id)
+            item['tokens'] = {'M': {k: {'S': str(v)} for k, v in tokens.items()}}
+            await client.put_item(TableName=self.table_name, Item=item)
+            logger.info(f"Saved tokens for user {user_id} to DynamoDB.")
+
+    async def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieve OAuth tokens from DynamoDB."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            key = await self.get_user_item(user_id)
+            response = await client.get_item(TableName=self.table_name, Key=key)
+            item = response.get('Item')
+            if item and 'tokens' in item:
+                tokens = {k: v['S'] for k, v in item['tokens']['M'].items()}
+                logger.info(f"Retrieved tokens for user {user_id} from DynamoDB.")
+                return tokens
+            return None
+
+    async def delete_tokens(self, user_id: int) -> None:
+        """Delete OAuth tokens from DynamoDB."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            key = await self.get_user_item(user_id)
+            update_expression = "REMOVE tokens"
+            await client.update_item(TableName=self.table_name, Key=key, UpdateExpression=update_expression)
+            logger.info(f"Deleted tokens for user {user_id} from DynamoDB.")
+
+    async def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
+        """Save user state to DynamoDB."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            item = await self.get_user_item(user_id)
+            item['state'] = {'M': {k: {'S': str(v)} for k, v in state.items()}}
+            await client.put_item(TableName=self.table_name, Item=item)
+            logger.info(f"Saved user state for user {user_id} to DynamoDB.")
+
+    async def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieve user state from DynamoDB."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            key = await self.get_user_item(user_id)
+            response = await client.get_item(TableName=self.table_name, Key=key)
+            item = response.get('Item')
+            if item and 'state' in item:
+                state = {k: v['S'] for k, v in item['state']['M'].items()}
+                logger.info(f"Retrieved user state for user {user_id} from DynamoDB.")
+                return state
+            return None
+
+    async def delete_user_state(self, user_id: int) -> None:
+        """Delete user state from DynamoDB."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            key = await self.get_user_item(user_id)
+            update_expression = "REMOVE state"
+            await client.update_item(TableName=self.table_name, Key=key, UpdateExpression=update_expression)
+            logger.info(f"Deleted user state for user {user_id} from DynamoDB.")
+
 class FirestoreRepository(IRepository):
     """Repository implementation using Google Firestore."""
 
     def __init__(self, config: 'Config'):
+        from google.cloud import firestore
         self.client = firestore.AsyncClient()
         self.collection = config.FIRESTORE_COLLECTION
         self.logger = logger
 
+    from google.cloud import firestore
     async def get_user_document(self, user_id: int) -> firestore.AsyncDocumentReference:
         """Get a reference to the user's document."""
         with start_span_smart(op="firestore", description="Get User Document"):
@@ -154,6 +223,7 @@ class FirestoreRepository(IRepository):
 
     async def delete_tokens(self, user_id: int) -> None:
         """Delete OAuth tokens from Firestore."""
+        from google.cloud import firestore
         with start_span_smart(op="firestore", description="Delete Tokens"):
             user_doc = await self.get_user_document(user_id)
             await user_doc.update({"tokens": firestore.DELETE_FIELD})
@@ -181,6 +251,7 @@ class FirestoreRepository(IRepository):
         """Delete user state from Firestore."""
         with start_span_smart(op="firestore", description="Delete User State"):
             user_doc = await self.get_user_document(user_id)
+            from google.cloud import firestore
             await user_doc.update({"state": firestore.DELETE_FIELD})
             self.logger.info(f"Deleted user state for user {user_id} from Firestore.")
 
@@ -292,8 +363,8 @@ class Config:
             logger.info("Using FileSystemRepository for local environment.")
             return FileSystemRepository(self)
         else:
-            logger.info("Using FirestoreRepository for production environment.")
-            return FirestoreRepository(self)
+            logger.info("Using DynamoDbRepository for production environment.")
+            return DynamoDbRepository()
 
 class BaseHandler(ABC):
     """Abstract base class for all handlers."""
