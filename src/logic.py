@@ -3,11 +3,13 @@
 import base64
 import datetime
 import json
-import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Generator
+
+from contextlib import contextmanager
 
 import litellm
 import pytz
@@ -25,6 +27,7 @@ from telegram.ext import CallbackContext, ConversationHandler
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 from google.cloud import firestore
+from loguru import logger
 
 # Constants
 SEARCH_MODEL = "gemini/gemini-1.5-flash-002"
@@ -45,6 +48,51 @@ class BotStates:
     """States for the conversation handler."""
     PARSE_INPUT = 1
     CONFIRMATION = 2
+
+
+@contextmanager
+def start_span_smart(op: str, description: str) -> Generator[Any, None, None]:
+    """
+    Smart context manager that profiles code execution either locally or with Sentry
+    based on the environment.
+
+    In debug/local environment, it logs execution time.
+    In production, it uses Sentry's performance monitoring.
+
+    Args:
+        op: Operation name/category (e.g. "db", "http", "cache")
+        description: Detailed description of the operation
+
+    Yields:
+        In debug mode: None
+        In production: Sentry span object
+
+    Usage:
+        with start_span_smart("db", "Fetch user profile") as span:
+            # Your code here
+            pass
+    """
+    try:
+        # Check if we're in debug/local environment
+        is_debug = __debug__ or os.getenv('ENVIRONMENT', '').lower() in ('local', 'development')
+
+        if is_debug:
+            start_time = time.perf_counter()
+            try:
+                yield None
+            finally:
+                elapsed_time = (time.perf_counter() - start_time) * 1000  # Convert to milliseconds
+                logger.debug(
+                    f"Operation '{op}' - {description} took {elapsed_time:.2f}ms"
+                )
+        else:
+            # Use actual Sentry span in production
+            with sentry_sdk.start_span(op=op, description=description) as span:
+                yield span
+
+    except Exception as e:
+        logger.exception(f"Error in span '{op}' - {description}: {str(e)}")
+        raise
 
 
 class IRepository(ABC):
@@ -81,46 +129,62 @@ class FirestoreRepository(IRepository):
     def __init__(self, config: 'Config'):
         self.client = firestore.Client()
         self.collection = config.FIRESTORE_COLLECTION
+        self.logger = logger
 
     def get_user_document(self, user_id: int) -> firestore.DocumentReference:
         """Get a reference to the user's document."""
-        return self.client.collection(self.collection).document(str(user_id))
+        with start_span_smart(op="firestore", description="Get User Document") as span:
+            return self.client.collection(self.collection).document(str(user_id))
 
     def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
         """Save OAuth tokens to Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.set({"tokens": tokens}, merge=True)
+        with start_span_smart(op="firestore", description="Save Tokens") as span:
+            user_doc = self.get_user_document(user_id)
+            user_doc.set({"tokens": tokens}, merge=True)
+            self.logger.info(f"Saved tokens for user {user_id} to Firestore.")
 
     def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve OAuth tokens from Firestore."""
         user_doc = self.get_user_document(user_id)
-        doc = user_doc.get()
-        if doc.exists:
-            return doc.to_dict().get("tokens")
+        with start_span_smart(op="firestore", description="Get Tokens") as span:
+            doc = user_doc.get()
+            if doc.exists:
+                tokens = doc.to_dict().get("tokens")
+                self.logger.info(f"Retrieved tokens for user {user_id} from Firestore.")
+                return tokens
         return None
 
     def delete_tokens(self, user_id: int) -> None:
         """Delete OAuth tokens from Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.update({"tokens": firestore.DELETE_FIELD})
+        with start_span_smart(op="firestore", description="Delete Tokens") as span:
+            user_doc = self.get_user_document(user_id)
+            user_doc.update({"tokens": firestore.DELETE_FIELD})
+            self.logger.info(f"Deleted tokens for user {user_id} from Firestore.")
 
     def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
         """Save user state to Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.set({"state": state}, merge=True)
+        with start_span_smart(op="firestore", description="Save User State") as span:
+            user_doc = self.get_user_document(user_id)
+            user_doc.set({"state": state}, merge=True)
+            self.logger.info(f"Saved user state for user {user_id} to Firestore.")
 
     def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve user state from Firestore."""
-        user_doc = self.get_user_document(user_id)
-        doc = user_doc.get()
-        if doc.exists:
-            return doc.to_dict().get("state")
-        return None
+        with start_span_smart(op="firestore", description="Get User State") as span:
+            user_doc = self.get_user_document(user_id)
+            doc = user_doc.get()
+            if doc.exists:
+                state = doc.to_dict().get("state")
+                self.logger.info(f"Retrieved user state for user {user_id} from Firestore.")
+                return state
+            return None
 
     def delete_user_state(self, user_id: int) -> None:
         """Delete user state from Firestore."""
-        user_doc = self.get_user_document(user_id)
-        user_doc.update({"state": firestore.DELETE_FIELD})
+        with start_span_smart(op="firestore", description="Delete User State") as span:
+            user_doc = self.get_user_document(user_id)
+            user_doc.update({"state": firestore.DELETE_FIELD})
+            self.logger.info(f"Deleted user state for user {user_id} from Firestore.")
 
 
 class FileSystemRepository(IRepository):
@@ -129,6 +193,7 @@ class FileSystemRepository(IRepository):
     def __init__(self, config: 'Config'):
         self.token_dir = os.path.abspath("../google_tokens")
         os.makedirs(self.token_dir, exist_ok=True)
+        self.logger = logger
 
     def _get_token_path(self, user_id: int) -> str:
         return os.path.join(self.token_dir, f"token_{user_id}.json")
@@ -140,14 +205,14 @@ class FileSystemRepository(IRepository):
         path = self._get_token_path(user_id)
         with open(path, 'w') as f:
             json.dump(tokens, f)
-        logging.info(f"Saved tokens for user {user_id} to {path}")
+        self.logger.info(f"Saved tokens for user {user_id} to {path}")
 
     def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
         path = self._get_token_path(user_id)
         if os.path.exists(path):
             with open(path, 'r') as f:
                 tokens = json.load(f)
-            logging.info(f"Retrieved tokens for user {user_id} from {path}")
+            self.logger.info(f"Retrieved tokens for user {user_id} from {path}")
             return tokens
         return None
 
@@ -155,20 +220,20 @@ class FileSystemRepository(IRepository):
         path = self._get_token_path(user_id)
         if os.path.exists(path):
             os.remove(path)
-            logging.info(f"Deleted tokens for user {user_id} from {path}")
+            self.logger.info(f"Deleted tokens for user {user_id} from {path}")
 
     def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
         path = self._get_state_path(user_id)
         with open(path, 'w') as f:
             json.dump(state, f)
-        logging.info(f"Saved user state for user {user_id} to {path}")
+        self.logger.info(f"Saved user state for user {user_id} to {path}")
 
     def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
         path = self._get_state_path(user_id)
         if os.path.exists(path):
             with open(path, 'r') as f:
                 state = json.load(f)
-            logging.info(f"Retrieved user state for user {user_id} from {path}")
+            self.logger.info(f"Retrieved user state for user {user_id} from {path}")
             return state
         return None
 
@@ -176,7 +241,7 @@ class FileSystemRepository(IRepository):
         path = self._get_state_path(user_id)
         if os.path.exists(path):
             os.remove(path)
-            logging.info(f"Deleted user state for user {user_id} from {path}")
+            self.logger.info(f"Deleted user state for user {user_id} from {path}")
 
 
 class Config:
@@ -204,25 +269,31 @@ class Config:
         self.FIRESTORE_COLLECTION = os.getenv("FIRESTORE_COLLECTION", "google_access_tokens")
 
         # Initialize Sentry SDK for production
-        sentry_logging = LoggingIntegration(
-            level=logging.INFO,        # Capture info and above as breadcrumbs
-            event_level=logging.ERROR  # Send errors as events
-        )
-        sentry_sdk.init(
-            dsn=self.SENTRY_DSN,
-            integrations=[sentry_logging],
-            traces_sample_rate=1.0,
-            profiles_sample_rate=1.0  # Profile 100% of sampled transactions
-        )
-        logging.getLogger(__name__).info("Sentry SDK initialized.")
+        if self.SENTRY_DSN:
+            sentry_logging = LoggingIntegration(
+                level="INFO",        # Capture info and above as breadcrumbs
+                event_level="ERROR"  # Send errors as events
+            )
+            sentry_sdk.init(
+                dsn=self.SENTRY_DSN,
+                integrations=[
+                    sentry_logging,
+                    # Add other integrations as needed
+                    # For example, if using Flask or Django, add their integrations
+                ],
+                traces_sample_rate=1.0,  # Adjust based on your needs
+                profiles_sample_rate=1.0,  # Profile 100% of sampled transactions
+                environment=self.ENV
+            )
+            logger.info("Sentry SDK initialized.")
 
     def get_repository(self) -> IRepository:
         """Returns the appropriate repository based on the environment."""
-        if self.ENV == "local":
-            logging.info("Using FileSystemRepository for local environment.")
+        if self.ENV.lower() == "local":
+            logger.info("Using FileSystemRepository for local environment.")
             return FileSystemRepository(self)
         else:
-            logging.info("Using FirestoreRepository for production environment.")
+            logger.info("Using FirestoreRepository for production environment.")
             return FirestoreRepository(self)
 
 
@@ -234,7 +305,7 @@ class BaseHandler(ABC):
         pass
 
 
-def download_audio_in_memory(message: Message, user_id: int, logger: logging.Logger) -> bytes:
+def download_audio_in_memory(message: Message, user_id: int) -> bytes:
     """Downloads audio from a Telegram message into RAM."""
     if message.voice:
         file = message.voice.get_file()
@@ -286,11 +357,11 @@ class RelevantEventResponse(BaseModel):
 class GoogleCalendarService:
     """Service to interact with Google Calendar API."""
 
-    def __init__(self, config: Config, logger: logging.Logger, repository: IRepository):
+    def __init__(self, config: Config, repository: IRepository):
         self.config = config
-        self.logger = logger
-        self.SCOPES = self.config.SCOPES
         self.repository = repository
+        self.SCOPES = self.config.SCOPES
+        self.logger = logger
 
     def generate_auth_url(self, user_id: int) -> str:
         """Generates the OAuth 2.0 authorization URL for the user."""
@@ -318,6 +389,7 @@ class GoogleCalendarService:
             prompt='consent'  # Forces consent screen to ensure refresh_token is received
         )
 
+        self.logger.info(f"Generated auth URL for user {user_id}.")
         return authorization_url
 
     def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials | None:
@@ -342,13 +414,15 @@ class GoogleCalendarService:
                 redirect_uri=self.config.GOOGLE_REDIRECT_URI
             )
 
-            # Fetch token using authorization_code
-            flow.fetch_token(code=authorization_code)
+            with start_span_smart(op="google_calendar", description="Get Credentials") as span:
+                # Fetch token using authorization_code
+                flow.fetch_token(code=authorization_code)
 
             creds = flow.credentials
 
             # Save credentials using the repository
             self.repository.save_tokens(user_id, json.loads(creds.to_json()))
+            self.logger.info(f"Credentials obtained and saved for user {user_id}.")
 
         else:
             tokens = self.repository.get_tokens(user_id)
@@ -360,14 +434,16 @@ class GoogleCalendarService:
 
                     # Convert JSON string to dictionary before saving
                     self.repository.save_tokens(user_id, json.loads(creds.to_json()))
+                    self.logger.info(f"Credentials refreshed and saved for user {user_id}.")
             else:
+                self.logger.warning(f"No tokens found for user {user_id}.")
                 return None
 
         return creds
 
     def create_event(self, event: CalendarEvent, user_id: int) -> Dict[str, Any]:
         """Creates an event in Google Calendar."""
-        with sentry_sdk.start_span(op="google_calendar", description="Creating event") as span:
+        with start_span_smart(op="google_calendar", description="Creating event") as span:
             try:
                 creds = self.get_credentials(user_id)
                 service = build('calendar', 'v3', credentials=creds)
@@ -410,9 +486,10 @@ class GoogleCalendarService:
                     else:
                         event_body['description'] = f"Connection Info: " + event.connection_info.replace("\\n", " ")
 
-                created_event = service.events().insert(calendarId='primary', body=event_body).execute()
-                self.logger.info(f"Created event: {created_event}")
-                return created_event
+                with start_span_smart(op="google_calendar", description="Inserting event") as inner_span:
+                    created_event = service.events().insert(calendarId='primary', body=event_body).execute()
+                    self.logger.info(f"Created event: {created_event}")
+                    return created_event
             except Exception as e:
                 self.logger.error(f"Failed to create event: {e}")
                 sentry_sdk.capture_exception(e)
@@ -420,7 +497,7 @@ class GoogleCalendarService:
 
     def delete_event(self, event_text: str, user_id: int, update: Update) -> Dict[str, Any]:
         """Deletes an event from Google Calendar based on identifier using LLM for relevance."""
-        with sentry_sdk.start_span(op="google_calendar", description="Deleting event") as span:
+        with start_span_smart(op="google_calendar", description="Deleting event") as span:
             try:
                 creds = self.get_credentials(user_id)
                 service = build('calendar', 'v3', credentials=creds)
@@ -437,7 +514,8 @@ class GoogleCalendarService:
                     self.logger.info("No events found in the calendar.")
                     return {"status": "not_found"}
 
-                update.message.reply_text(f"Searching in {len(events)} events for the most relevant one...")
+                with start_span_smart(op="telegram", description="Replying to user") as inner_span:
+                    update.message.reply_text(f"Searching in {len(events)} events for the most relevant one...")
 
                 # Utilize LLM to find the most relevant event based on identifier
                 relevant_event: Optional[RelevantEventResponse] = self.find_relevant_event_with_llm(event_text, events)
@@ -462,7 +540,8 @@ class GoogleCalendarService:
 
     def reschedule_event(self, details: Dict[str, Any], user_id: int, update: Update) -> Dict[str, Any]:
         """Reschedules an existing event based on identifier and new details using LLM for relevance."""
-        with sentry_sdk.start_span(op="google_calendar", description="Rescheduling event") as span:
+        # TODO: Reimplement this feature
+        with start_span_smart(op="google_calendar", description="Rescheduling event") as span:
             try:
                 event_text = details.get('event_text')
                 new_date = details.get('new_date')
@@ -602,14 +681,15 @@ class GoogleCalendarService:
         ]
 
         try:
-            response = litellm.completion(
-                model=SEARCH_MODEL,
-                messages=messages,
-                temperature=0,  # IT'S VERY IMPORTANT TO SET TEMPERATURE TO 0.
-                response_format=RelevantEventResponse,
-                retries=3,
-                fallbacks=[FallbacksModels.SearchFallbacks]
-            )
+            with start_span_smart(op="llm", description="Finding relevant event") as span:
+                response = litellm.completion(
+                    model=SEARCH_MODEL,
+                    messages=messages,
+                    temperature=0,  # IT'S VERY IMPORTANT TO SET TEMPERATURE TO 0.
+                    response_format=RelevantEventResponse,
+                    retries=3,
+                    fallbacks=[FallbacksModels.SearchFallbacks]
+                )
             response_content: str = response['choices'][0]['message']['content']
             response_data: Dict[str, Any] = json.loads(response_content)
             matched_event: RelevantEventResponse = RelevantEventResponse(**response_data)
@@ -625,10 +705,10 @@ class GoogleCalendarService:
 class LiteLLMService:
     """Service to interact with LiteLLM for function calling."""
 
-    def __init__(self, config: Config, logger: logging.Logger, google_calendar_service: GoogleCalendarService):
+    def __init__(self, config: Config, google_calendar_service: GoogleCalendarService):
         self.config = config
-        self.logger = logger
         self.google_calendar_service = google_calendar_service
+        self.logger = logger
         # Define function schemas for function calling
         self.functions = [
             {
@@ -758,12 +838,12 @@ class LiteLLMService:
 class InputHandler(BaseHandler):
     """Handler for parsing user input."""
 
-    def __init__(self, logger: logging.Logger, litellm_service: LiteLLMService,
+    def __init__(self, litellm_service: LiteLLMService,
                  google_calendar_service: GoogleCalendarService, repository: IRepository):
-        self.logger = logger
         self.litellm_service = litellm_service
         self.google_calendar_service = google_calendar_service
         self.repository = repository
+        self.logger = logger
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="InputHandler.handle") as transaction:
@@ -790,7 +870,8 @@ class InputHandler(BaseHandler):
                     return ConversationHandler.END
 
                 # Inform the user that the message is being processed
-                update.message.reply_text("Processing your request...")
+                with start_span_smart(op="telegram", description="Send Processing Message") as span:
+                    update.message.reply_text("Processing your request...")
 
                 # IT'S 100% RIGHT TO USE update.message.text_markdown_v2_urled INSTEAD OF update.message.text_markdown_v2.
                 user_message: Optional[str] = update.message.text_markdown_v2_urled or update.message.caption_markdown_v2_urled
@@ -825,7 +906,7 @@ class InputHandler(BaseHandler):
                 is_voice = bool(update.message.voice or update.message.audio)
                 if is_voice:
                     # Handle voice or audio messages: download and transcribe
-                    audio_bytes = download_audio_in_memory(update.message, user_id, self.logger)
+                    audio_bytes = download_audio_in_memory(update.message, user_id)
                     encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
                     messages = [
                         {"role": "system", "content": system_prompt},
@@ -853,11 +934,13 @@ class InputHandler(BaseHandler):
 
                 try:
                     model = COMMANDS_MODEL_VOICE if is_voice else COMMANDS_MODEL_TEXT
-                    response: Dict[str, Any] = self.litellm_service.get_completion(
-                        model=model,
-                        messages=messages,
-                        tool_choice="auto",
-                    )
+                    response: Dict[str, Any] = {}
+                    with start_span_smart(op="llm", description="Get completion") as span:
+                        response = self.litellm_service.get_completion(
+                            model=model,
+                            messages=messages,
+                            tool_choice="auto",
+                        )
 
                     self.logger.info(f"LLM Response:\n{response}")
                     # IT'S 100% RIGHT TO USE response['choices'][0]['message'].
@@ -879,14 +962,18 @@ class InputHandler(BaseHandler):
                             # Send action info to the user
                             action_info: Optional[str] = result.get("action_info")
                             if action_info:
-                                update.message.reply_text(f"About to perform: {action_info}")
+                                with start_span_smart(op="telegram", description="Send Action Info") as inner_span:
+                                    update.message.reply_text(f"About to perform: {action_info}")
 
                             # Check if confirmation is required
                             if result.get("status") == "requires_confirmation":
                                 event: Optional[RelevantEventResponse] = result.get("event")
                                 if event:
-                                    update.message.reply_text(f"Found event: {event.event_name}")
-                                update.message.reply_text("Do you want to proceed with this action? (Yes/No)")
+                                    with start_span_smart(op="telegram", description="Send Confirmation Request") as inner_span:
+                                        update.message.reply_text(f"Found event: {event.event_name}")
+
+                                with start_span_smart(op="telegram", description="Send Confirmation Request") as inner_span:
+                                    update.message.reply_text("Do you want to proceed with this action? (Yes/No)")
 
                                 # Save pending action to the repository
                                 pending_action = {
@@ -947,12 +1034,12 @@ class InputHandler(BaseHandler):
 class ConfirmationHandler(BaseHandler):
     """Handler for confirming event actions when LLM is unsure."""
 
-    def __init__(self, logger: logging.Logger, litellm_service: LiteLLMService,
+    def __init__(self, litellm_service: LiteLLMService,
                  google_calendar_service: GoogleCalendarService, repository: IRepository):
-        self.logger = logger
         self.litellm_service = litellm_service
         self.google_calendar_service = google_calendar_service
         self.repository = repository
+        self.logger = logger
 
     def handle(self, update: Update, context: CallbackContext) -> int:
         with sentry_sdk.start_transaction(op="handler", name="ConfirmationHandler.handle") as transaction:
@@ -1036,7 +1123,7 @@ class ConfirmationHandler(BaseHandler):
 class CancelHandler(BaseHandler):
     """Handler for the /cancel command."""
 
-    def __init__(self, logger: logging.Logger):
+    def __init__(self):
         self.logger = logger
 
     def handle(self, update: Update, context: CallbackContext) -> int:
@@ -1054,7 +1141,7 @@ class CancelHandler(BaseHandler):
 class StartHandler(BaseHandler):
     """Handler for the /start command."""
 
-    def __init__(self, logger: logging.Logger):
+    def __init__(self):
         self.logger = logger
 
     def handle(self, update: Update, context: CallbackContext) -> int:
@@ -1074,16 +1161,3 @@ class StartHandler(BaseHandler):
             sentry_sdk.capture_exception(e)
             update.message.reply_text(f"An error occurred while starting the bot.\n{e}")
             return ConversationHandler.END
-
-
-class LoggerSetup:
-    """Sets up the logging configuration."""
-
-    @staticmethod
-    def setup_logging(level: str = "INFO") -> logging.Logger:
-        logging.basicConfig(
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            level=getattr(logging, level.upper(), logging.INFO)
-        )
-        logger = logging.getLogger(__name__)
-        return logger

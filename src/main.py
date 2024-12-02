@@ -1,19 +1,16 @@
 # server.py
 
-import logging
 import os
 from queue import Queue
 from threading import Thread
 
 import sentry_sdk
 from flask import Flask, request
-from sentry_sdk.integrations.logging import LoggingIntegration
 from telegram import Update, Bot
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler
 
 from logic import (
     Config,
-    LoggerSetup,
     GoogleCalendarService,
     LiteLLMService,
     StartHandler,
@@ -22,36 +19,22 @@ from logic import (
     CancelHandler,
     BotStates
 )
+from loguru import logger
 
 # Initialize Flask App
 app = Flask(__name__)
 
 # Load Configuration
 config = Config()
-logger = LoggerSetup.setup_logging(config.LOGGING_MIN_LEVEL)
-
-# Initialize Sentry SDK (Ensure this is done before any logging)
-if config.SENTRY_DSN:
-    sentry_logging = LoggingIntegration(
-        level=logging.INFO,        # Capture info and above as breadcrumbs
-        event_level=logging.ERROR  # Send errors as events
-    )
-    sentry_sdk.init(
-        dsn=config.SENTRY_DSN,
-        integrations=[sentry_logging],
-        traces_sample_rate=1.0,
-        profiles_sample_rate=1.0  # Profile 100% of sampled transactions
-    )
-    logger.info("Sentry SDK initialized.")
 
 # Initialize Repository based on environment
 repository = config.get_repository()
 
 # Initialize Google Calendar Service
-google_calendar_service = GoogleCalendarService(config, logger, repository)
+google_calendar_service = GoogleCalendarService(config, repository)
 
 # Initialize LiteLLM Service
-litellm_service = LiteLLMService(config, logger, google_calendar_service)
+litellm_service = LiteLLMService(config, google_calendar_service)
 
 # Initialize Telegram Bot
 bot = Bot(token=config.TELEGRAM_TOKEN)
@@ -70,10 +53,10 @@ dispatcher = Dispatcher(
 )
 
 # Initialize Handlers
-start_handler = StartHandler(logger)
-input_handler = InputHandler(logger, litellm_service, google_calendar_service, repository)
-confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service, repository)
-cancel_handler = CancelHandler(logger)
+start_handler = StartHandler()
+input_handler = InputHandler(litellm_service, google_calendar_service, repository)
+confirmation_handler = ConfirmationHandler(litellm_service, google_calendar_service, repository)
+cancel_handler = CancelHandler()
 
 # Define the ConversationHandler with states PARSE_INPUT and CONFIRMATION
 conv_handler = ConversationHandler(
@@ -111,6 +94,7 @@ def set_webhook():
     else:
         logger.error(f"Failed to set webhook to {webhook_endpoint}")
 
+
 # Function to start the Dispatcher
 def start_dispatcher():
     """Starts the Dispatcher in a separate thread."""
@@ -118,10 +102,12 @@ def start_dispatcher():
     dispatcher_thread.start()
     logger.info("Dispatcher thread started.")
 
+
 # Flask route for the root
 @app.route('/', methods=['GET'])
 def index():
     return 'OK', 200
+
 
 # Flask route for handling Telegram webhooks
 @app.route('/webhook', methods=['POST'])
@@ -138,6 +124,7 @@ def webhook():
         sentry_sdk.capture_exception(e)
         return "Internal Server Error", 500
 
+
 # Flask route for handling Google OAuth callback
 @app.route('/google_callback', methods=['GET'])
 def google_callback():
@@ -145,11 +132,13 @@ def google_callback():
     state = request.args.get('state')  # Contains user_id
 
     if not code or not state:
+        logger.warning("Missing authorization code or state parameter.")
         return "Missing authorization code or state parameter.", 400
 
     try:
         user_id = int(state)
     except ValueError:
+        logger.error("Invalid state parameter.")
         return "Invalid state parameter.", 400
 
     try:
@@ -162,6 +151,7 @@ def google_callback():
         logger.error(f"Error in Google callback: {e}")
         sentry_sdk.capture_exception(e)
         return "Authorization failed! Please try again.", 200
+
 
 def run_local():
     """Runs the bot in local development mode using polling."""
@@ -181,6 +171,7 @@ def run_local():
     logger.info("Bot is polling for updates.")
     updater.idle()
 
+
 def run_production():
     """Runs the bot in production mode using webhooks."""
     # Start the Dispatcher
@@ -194,6 +185,7 @@ def run_production():
     # Run the Flask app
     # GAE uses a WSGI server to serve the Flask app; no need to call app.run()
     # Ensure that the Flask app is exposed as a WSGI callable named 'app'
+
 
 if __name__ == '__main__':
     environment = config.ENV.lower()
