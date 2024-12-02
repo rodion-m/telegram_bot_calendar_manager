@@ -1,6 +1,7 @@
-# server.py
+# main.py
 
 import os
+import sys
 from queue import Queue
 from threading import Thread
 
@@ -9,7 +10,7 @@ from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler
 
-from logic import (
+from src.logic import (
     Config,
     GoogleCalendarService,
     LiteLLMService,
@@ -20,6 +21,9 @@ from logic import (
     BotStates
 )
 from loguru import logger
+
+logger.add(sys.stdout, level="INFO")
+logger.add(sys.stderr, level="ERROR")
 
 # Initialize Flask App
 app = Flask(__name__)
@@ -182,14 +186,11 @@ def run_production():
 
     logger.info("Bot is running in production mode with webhooks.")
 
-    # Run the Flask app
-    # GAE uses a WSGI server to serve the Flask app; no need to call app.run()
-    # Ensure that the Flask app is exposed as a WSGI callable named 'app'
+    app.run()
 
 
+# environment = config.ENV.lower()
 if __name__ == '__main__':
-    environment = config.ENV.lower()
-    if environment == "local":
-        run_local()
-    else:
-        run_production()
+    run_local()
+else:
+    run_production()
