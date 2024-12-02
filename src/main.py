@@ -1,25 +1,17 @@
-"""
-Server module for Telegram bot running on Google App Engine.
-Handles webhook-based updates and Google Calendar authentication.
-"""
+# server.py
 
+import logging
 import os
 from queue import Queue
-from typing import Optional
+from threading import Thread
 
-import flask
 import sentry_sdk
-from flask import Flask, request, Response
+from flask import Flask, request
+from sentry_sdk.integrations.logging import LoggingIntegration
 from telegram import Update, Bot
-from telegram.ext import (
-    Dispatcher,
-    CommandHandler,
-    MessageHandler,
-    Filters,
-    ConversationHandler,
-)
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler
 
-from src.logic import (
+from logic import (
     Config,
     LoggerSetup,
     GoogleCalendarService,
@@ -28,151 +20,184 @@ from src.logic import (
     ConfirmationHandler,
     InputHandler,
     CancelHandler,
-    BotStates,
+    BotStates
 )
 
-# Initialize Flask app
+# Initialize Flask App
 app = Flask(__name__)
 
-# Global variables for services
-config: Optional[Config] = None
-dispatcher: Optional[Dispatcher] = None
-logger = None
-google_calendar_service: Optional[GoogleCalendarService] = None
+# Load Configuration
+config = Config()
+logger = LoggerSetup.setup_logging(config.LOGGING_MIN_LEVEL)
 
-
-def create_app() -> Flask:
-    """
-    Initialize the Flask application and all required services.
-    Returns:
-        Flask: Configured Flask application
-    """
-    global config, dispatcher, logger, google_calendar_service
-
-    # Initialize core services
-    config = Config() # Sentry initialization is done in Config
-    logger = LoggerSetup.setup_logging(config.LOGGING_MIN_LEVEL)
-
-    # Initialize services
-    repository = config.get_repository()
-    google_calendar_service = GoogleCalendarService(config, logger, repository)
-    litellm_service = LiteLLMService(config, logger, google_calendar_service)
-
-    # Initialize bot handlers
-    start_handler = StartHandler(logger)
-    input_handler = InputHandler(logger, litellm_service, google_calendar_service, repository)
-    confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service, repository)
-    cancel_handler = CancelHandler(logger)
-
-    bot = Bot(token=config.TELEGRAM_TOKEN)
-
-    # Initialize the Update Queue
-    update_queue = Queue()
-
-    # Initialize dispatcher without updater (webhook mode)
-    dispatcher = Dispatcher(
-        bot=bot,
-        update_queue=update_queue,
-        use_context=True,
-        context_types=None  # Uses default ContextTypes
+# Initialize Sentry SDK (Ensure this is done before any logging)
+if config.SENTRY_DSN:
+    sentry_logging = LoggingIntegration(
+        level=logging.INFO,        # Capture info and above as breadcrumbs
+        event_level=logging.ERROR  # Send errors as events
     )
+    sentry_sdk.init(
+        dsn=config.SENTRY_DSN,
+        integrations=[sentry_logging],
+        traces_sample_rate=1.0,
+        profiles_sample_rate=1.0  # Profile 100% of sampled transactions
+    )
+    logger.info("Sentry SDK initialized.")
 
-    # Configure conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('start', start_handler.handle),
-            MessageHandler(
-                (Filters.text | Filters.voice | Filters.audio | Filters.caption) & ~Filters.command,
-                input_handler.handle
-            )
+# Initialize Repository based on environment
+repository = config.get_repository()
+
+# Initialize Google Calendar Service
+google_calendar_service = GoogleCalendarService(config, logger, repository)
+
+# Initialize LiteLLM Service
+litellm_service = LiteLLMService(config, logger, google_calendar_service)
+
+# Initialize Telegram Bot
+bot = Bot(token=config.TELEGRAM_TOKEN)
+
+# Initialize the Update Queue
+update_queue = Queue()
+
+# Initialize Dispatcher with the update_queue
+# THE Dispatcher call parameters ordering is 100% correct.
+dispatcher = Dispatcher(
+    bot=bot,
+    update_queue=update_queue,
+    workers=4,  # Number of worker threads; adjust as needed
+    use_context=True,
+    context_types=None  # Uses default ContextTypes
+)
+
+# Initialize Handlers
+start_handler = StartHandler(logger)
+input_handler = InputHandler(logger, litellm_service, google_calendar_service, repository)
+confirmation_handler = ConfirmationHandler(logger, litellm_service, google_calendar_service, repository)
+cancel_handler = CancelHandler(logger)
+
+# Define the ConversationHandler with states PARSE_INPUT and CONFIRMATION
+conv_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler('start', start_handler.handle),
+        MessageHandler(
+            (Filters.text | Filters.voice | Filters.audio | Filters.caption) & ~Filters.command,
+            input_handler.handle
+        )
+    ],
+    states={
+        BotStates.PARSE_INPUT: [
+            MessageHandler(Filters.text | Filters.voice | Filters.audio, input_handler.handle)
         ],
-        states={
-            BotStates.PARSE_INPUT: [
-                MessageHandler(Filters.text | Filters.voice | Filters.audio, input_handler.handle)
-            ],
-            BotStates.CONFIRMATION: [
-                MessageHandler(
-                    Filters.regex('^(Yes|No|Y|N|yes|no|y|n|да|Да|д|Нет|нет|н)$'),
-                    confirmation_handler.handle
-                )
-            ],
-        },
-        fallbacks=[CommandHandler('cancel', cancel_handler.handle)],
-    )
+        BotStates.CONFIRMATION: [
+            MessageHandler(Filters.regex('^(Yes|No|Y|N|yes|no|y|n|да|Да|д|Нет|нет|н)$'), confirmation_handler.handle)
+        ],
+    },
+    fallbacks=[CommandHandler('cancel', cancel_handler.handle)],
+)
 
-    dispatcher.add_handler(conv_handler)
+dispatcher.add_handler(conv_handler)
 
-    return app
+# Function to set the webhook
+def set_webhook():
+    """Sets the webhook for the Telegram bot."""
+    webhook_url = os.getenv("WEBHOOK_URL")  # Ensure this is set to your public HTTPS URL
+    if not webhook_url:
+        logger.error("WEBHOOK_URL environment variable not set.")
+        return
+    webhook_endpoint = f"{webhook_url}/webhook"
+    success = bot.set_webhook(url=webhook_endpoint)
+    if success:
+        logger.info(f"Webhook set successfully to {webhook_endpoint}")
+    else:
+        logger.error(f"Failed to set webhook to {webhook_endpoint}")
 
+# Function to start the Dispatcher
+def start_dispatcher():
+    """Starts the Dispatcher in a separate thread."""
+    dispatcher_thread = Thread(target=dispatcher.start, name="DispatcherThread", daemon=True)
+    dispatcher_thread.start()
+    logger.info("Dispatcher thread started.")
 
-# Create the Flask app
-app = create_app()
-
-
-@app.route('/_ah/warmup')
-def warmup() -> str:
-    """Handle App Engine warmup requests."""
-    return 'OK'
-
-
+# Flask route for the root
 @app.route('/', methods=['GET'])
-def health_check() -> str:
-    """Basic health check endpoint."""
-    return 'OK'
+def index():
+    return 'OK', 200
 
-
+# Flask route for handling Telegram webhooks
 @app.route('/webhook', methods=['POST'])
-def webhook() -> str:
-    """
-    Handle incoming webhook requests from Telegram.
-    Returns:
-        str: Status response
-    """
-    if not dispatcher:
-        logger.error("Dispatcher not initialized")
-        return "Error: Dispatcher not initialized", 500
-
+def webhook():
     try:
-        update = Update.de_json(request.get_json(force=True), dispatcher.bot)
-        dispatcher.process_update(update)
-        return "OK"
+        update_json = request.get_json(force=True)
+        update = Update.de_json(update_json, bot)
+        # Enqueue the update for the Dispatcher to process
+        update_queue.put(update)
+        logger.debug(f"Update enqueued: {update}")
+        return "OK", 200
     except Exception as e:
-        logger.error(f"Error processing update: {e}")
+        logger.error(f"Error in webhook: {e}")
         sentry_sdk.capture_exception(e)
-        return "Error processing update", 500
+        return "Internal Server Error", 500
 
-
-@app.route('/google_callback')
-def google_callback() -> Response:
-    """
-    Handle Google OAuth2 callback requests.
-    Returns:
-        Response: Flask response object
-    """
+# Flask route for handling Google OAuth callback
+@app.route('/google_callback', methods=['GET'])
+def google_callback():
     code = request.args.get('code')
-    state = request.args.get('state')
+    state = request.args.get('state')  # Contains user_id
 
     if not code or not state:
-        return Response("Missing required parameters", status=400)
+        return "Missing authorization code or state parameter.", 400
 
     try:
         user_id = int(state)
-        creds = google_calendar_service.get_credentials(user_id, authorization_code=code)
-        return Response(
-            "Authorization successful! You can now return to the bot and continue.",
-            status=200
-        )
     except ValueError:
-        return Response("Invalid state parameter", status=400)
+        return "Invalid state parameter.", 400
+
+    try:
+        creds = google_calendar_service.get_credentials(user_id, authorization_code=code)
+        # At this point, credentials are stored. Notify the user via Telegram.
+        bot.send_message(chat_id=user_id, text="Authorization successful! You can now continue using the bot.")
+        logger.info(f"User {user_id} authorized successfully.")
+        return "Authorization successful! You can now return to the bot and continue.", 200
     except Exception as e:
         logger.error(f"Error in Google callback: {e}")
         sentry_sdk.capture_exception(e)
-        return Response("Authorization failed! Please try again.", status=500)
+        return "Authorization failed! Please try again.", 200
 
+def run_local():
+    """Runs the bot in local development mode using polling."""
+    logger.info("Starting bot in local mode with polling.")
+
+    from telegram.ext import Updater
+
+    # Initialize Updater for polling
+    updater = Updater(token=config.TELEGRAM_TOKEN, use_context=True)
+    local_dispatcher = updater.dispatcher
+
+    # Add handlers to the local dispatcher
+    local_dispatcher.add_handler(conv_handler)
+
+    # Start polling
+    updater.start_polling()
+    logger.info("Bot is polling for updates.")
+    updater.idle()
+
+def run_production():
+    """Runs the bot in production mode using webhooks."""
+    # Start the Dispatcher
+    start_dispatcher()
+
+    # Set the webhook
+    set_webhook()
+
+    logger.info("Bot is running in production mode with webhooks.")
+
+    # Run the Flask app
+    # GAE uses a WSGI server to serve the Flask app; no need to call app.run()
+    # Ensure that the Flask app is exposed as a WSGI callable named 'app'
 
 if __name__ == '__main__':
-    # Local development server
-    if os.getenv("ENV", "production").lower() == "local":
-        app.run(host='localhost', port=8080, debug=True)
+    environment = config.ENV.lower()
+    if environment == "local":
+        run_local()
     else:
-        app.run()
+        run_production()
