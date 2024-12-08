@@ -53,13 +53,13 @@ conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start_handler.handle),
         MessageHandler(
-            (filters.TEXT | filters.VOICE | filters.AUDIO | filters.Caption) & ~filters.COMMAND,
+            (filters.TEXT | filters.VOICE | filters.AUDIO | filters.CAPTION) & ~filters.COMMAND,
             input_handler.handle,
         ),
     ],
     states={
         BotStates.PARSE_INPUT: [
-            MessageHandler(filters.TEXT | filters.VOICE | filters.AUDIO, input_handler.handle)
+            MessageHandler((filters.TEXT | filters.VOICE | filters.AUDIO | filters.CAPTION) & ~filters.COMMAND, input_handler.handle)
         ],
         BotStates.CONFIRMATION: [
             MessageHandler(
