@@ -16,6 +16,7 @@ import aioboto3
 import litellm
 import pytz
 import telegram
+from cryptography.hazmat.backends import default_backend
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -51,6 +52,46 @@ class BotStates:
     AUTHENTICATE = 1
     PARSE_INPUT = 2
     CONFIRMATION = 3
+
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+def encrypt_data(plaintext: str, encryption_key: bytes) -> str:
+    """
+    Encrypts plaintext using AES-GCM.
+
+    Args:
+        plaintext (str): The data to encrypt.
+        encryption_key (bytes): The AES key (32 bytes for AES-256).
+
+    Returns:
+        str: The encrypted data encoded in base64.
+    """
+    aesgcm = AESGCM(encryption_key)
+    nonce = os.urandom(12)  # 96-bit nonce for AES-GCM
+    ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
+    encrypted = base64.b64encode(nonce + ciphertext).decode('utf-8')
+    return encrypted
+
+
+def decrypt_data(encrypted_data: str, encryption_key: bytes) -> str:
+    """
+    Decrypts data encrypted with AES-GCM.
+
+    Args:
+        encrypted_data (str): The encrypted data in base64.
+        encryption_key (bytes): The AES key (32 bytes for AES-256).
+
+    Returns:
+        str: The decrypted plaintext.
+    """
+    aesgcm = AESGCM(encryption_key)
+    data = base64.b64decode(encrypted_data.encode('utf-8'))
+    nonce = data[:12]
+    ciphertext = data[12:]
+    plaintext = aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
+    return plaintext
 
 @contextmanager
 def start_span_smart(op: str, description: str) -> Generator[Any, None, None]:
@@ -141,32 +182,49 @@ class IRepository(ABC):
 class DynamoDbRepository(IRepository):
     """Repository implementation using Amazon DynamoDB."""
 
-    def __init__(self, table_name: str = 'google-telegram-planner', region_name: str = 'eu-north-1'):
+    def __init__(self, encryption_key: bytes, table_name: str = 'google-telegram-planner', region_name: str = 'eu-north-1'):
         self.table_name = table_name
         self.region_name = region_name
+        self.encryption_key = encryption_key
 
     async def get_user_item(self, user_id: int) -> Dict[str, Any]:
         """Construct the primary key for the user's item."""
         return {'user_id': {'N': str(user_id)}}
 
     async def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
-        """Save OAuth tokens to DynamoDB."""
+        """Save OAuth tokens to DynamoDB, encrypted."""
         async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
             item = await self.get_user_item(user_id)
-            item['tokens'] = {'M': {k: {'S': str(v)} for k, v in tokens.items()}}
+
+            # Convert tokens dict to JSON string
+            tokens_json = json.dumps(tokens)
+
+            # Encrypt the tokens
+            encrypted_tokens = encrypt_data(tokens_json, self.encryption_key)
+
+            # Store as a single encrypted string
+            item['tokens'] = {'S': encrypted_tokens}
+
             await client.put_item(TableName=self.table_name, Item=item)
-            logger.info(f"Saved tokens for user {user_id} to DynamoDB.")
+            logger.info(f"Saved encrypted tokens for user {user_id} to DynamoDB.")
 
     async def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Retrieve OAuth tokens from DynamoDB."""
+        """Retrieve OAuth tokens from DynamoDB, decrypted."""
         async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
             key = await self.get_user_item(user_id)
             response = await client.get_item(TableName=self.table_name, Key=key)
             item = response.get('Item')
             if item and 'tokens' in item:
-                tokens = {k: v['S'] for k, v in item['tokens']['M'].items()}
-                logger.info(f"Retrieved tokens for user {user_id} from DynamoDB.")
-                return tokens
+                encrypted_tokens = item['tokens']['S']
+                try:
+                    tokens_json = decrypt_data(encrypted_tokens, self.encryption_key)
+                    tokens = json.loads(tokens_json)
+                    logger.info(f"Retrieved and decrypted tokens for user {user_id} from DynamoDB.")
+                    return tokens
+                except Exception as e:
+                    logger.error(f"Failed to decrypt tokens for user {user_id}: {e}")
+                    sentry_sdk.capture_exception(e)
+                    return None
             return None
 
     async def delete_tokens(self, user_id: int) -> None:
@@ -426,6 +484,17 @@ class Config:
         self.FIRESTORE_PROJECT = os.getenv("FIRESTORE_PROJECT")
         self.FIRESTORE_COLLECTION = os.getenv("FIRESTORE_COLLECTION", "google_access_tokens")
 
+        encryption_key_hex = os.getenv("ENCRYPTION_KEY")
+        if not encryption_key_hex:
+            raise ValueError("ENCRYPTION_KEY environment variable not set.")
+
+        self.ENCRYPTION_KEY = bytes.fromhex(encryption_key_hex)
+        if len(self.ENCRYPTION_KEY) != 32:
+            raise ValueError("ENCRYPTION_KEY must be 32 bytes (64 hex characters) for AES-256.")
+
+        # Initialize cipher (will use a random IV for each encryption)
+        self.backend = default_backend()
+
         # Initialize Sentry SDK for production
         if self.SENTRY_DSN:
             sentry_logging = LoggingIntegration(
@@ -451,7 +520,7 @@ class Config:
             return TinyDbRepository()
         else:
             logger.info("Using DynamoDbRepository for production environment.")
-            return DynamoDbRepository()
+            return DynamoDbRepository(encryption_key=self.ENCRYPTION_KEY)
 
 class BaseHandler(ABC):
     """Abstract base class for all handlers."""
