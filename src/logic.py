@@ -123,6 +123,21 @@ class IRepository(ABC):
     async def delete_user_state(self, user_id: int) -> None:
         pass
 
+    @abstractmethod
+    async def get_daily_request_count(self, user_id: int) -> (int, str):
+        """Retrieve the daily request count and last request date for a user."""
+        pass
+
+    @abstractmethod
+    async def increment_daily_request_count(self, user_id: int) -> None:
+        """Increment the daily request count for a user."""
+        pass
+
+    @abstractmethod
+    async def reset_daily_request_count(self, user_id: int, new_date: str) -> None:
+        """Reset the daily request count for a user with the new date."""
+        pass
+
 class DynamoDbRepository(IRepository):
     """Repository implementation using Amazon DynamoDB."""
 
@@ -203,6 +218,49 @@ class DynamoDbRepository(IRepository):
             update_expression = "REMOVE state"
             await client.update_item(TableName=self.table_name, Key=key, UpdateExpression=update_expression)
             logger.info(f"Deleted user state for user {user_id} from DynamoDB.")
+
+    async def get_daily_request_count(self, user_id: int) -> (int, str):
+        """Retrieve the daily request count and last request date for a user."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            key = await self.get_user_item(user_id)
+            response = await client.get_item(TableName=self.table_name, Key=key)
+            item = response.get('Item')
+            if item and 'daily_requests' in item:
+                daily_requests = item['daily_requests'].get('N', '0')
+                last_request_date = item['last_request_date'].get('S', '')
+                return int(daily_requests), last_request_date
+            return 0, ''
+
+    async def increment_daily_request_count(self, user_id: int) -> None:
+        """Increment the daily request count for a user."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            key = await self.get_user_item(user_id)
+            update_expression = "ADD daily_requests :inc"
+            expression_attribute_values = {":inc": {"N": "1"}}
+            await client.update_item(
+                TableName=self.table_name,
+                Key=key,
+                UpdateExpression=update_expression,
+                ExpressionAttributeValues=expression_attribute_values
+            )
+            logger.info(f"Incremented daily request count for user {user_id}.")
+
+    async def reset_daily_request_count(self, user_id: int, new_date: str) -> None:
+        """Reset the daily request count for a user with the new date."""
+        async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
+            key = await self.get_user_item(user_id)
+            update_expression = "SET daily_requests = :zero, last_request_date = :date"
+            expression_attribute_values = {
+                ":zero": {"N": "0"},
+                ":date": {"S": new_date}
+            }
+            await client.update_item(
+                TableName=self.table_name,
+                Key=key,
+                UpdateExpression=update_expression,
+                ExpressionAttributeValues=expression_attribute_values
+            )
+            logger.info(f"Reset daily request count for user {user_id} on {new_date}.")
 
 class TinyDbRepository(IRepository):
     """Repository implementation using TinyDB."""
@@ -308,6 +366,39 @@ class TinyDbRepository(IRepository):
         """
         User = Query()
         self.state_table.remove(User.user_id == user_id)
+
+    async def get_daily_request_count(self, user_id: int) -> (int, str):
+        """Retrieve the daily request count and last request date for a user."""
+        User = Query()
+        result = self.state_table.get(User.user_id == user_id)
+        if result:
+            daily_requests = result.get('daily_requests', 0)
+            last_request_date = result.get('last_request_date', '')
+            return daily_requests, last_request_date
+        return 0, ''
+
+    async def increment_daily_request_count(self, user_id: int) -> None:
+        """Increment the daily request count for a user."""
+        User = Query()
+        result = self.state_table.get(User.user_id == user_id)
+        if result:
+            new_count = result.get('daily_requests', 0) + 1
+            self.state_table.update({'daily_requests': new_count}, User.user_id == user_id)
+        else:
+            # If no state exists, create one
+            self.state_table.insert({'user_id': user_id, 'daily_requests': 1, 'last_request_date': ''})
+        logger.info(f"Incremented daily request count for user {user_id}.")
+
+    async def reset_daily_request_count(self, user_id: int, new_date: str) -> None:
+        """Reset the daily request count for a user with the new date."""
+        User = Query()
+        result = self.state_table.get(User.user_id == user_id)
+        if result:
+            self.state_table.update({'daily_requests': 0, 'last_request_date': new_date}, User.user_id == user_id)
+        else:
+            # If no state exists, create one
+            self.state_table.insert({'user_id': user_id, 'daily_requests': 0, 'last_request_date': new_date})
+        logger.info(f"Reset daily request count for user {user_id} on {new_date}.")
 
 class Config:
     """Configuration management using environment variables."""
@@ -965,6 +1056,32 @@ class InputHandler(BaseHandler):
                         "Please enter password to authenticate."
                     )
                     return BotStates.AUTHENTICATE
+
+                current_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+                # Retrieve user's daily request count and last request date
+                daily_count, last_request_date = await self.repository.get_daily_request_count(user_id)
+
+                if last_request_date != current_date:
+                    # Reset count for new day
+                    await self.repository.reset_daily_request_count(user_id, current_date)
+                    daily_count = 0
+                    self.logger.info(f"Reset daily request count for user {user_id} for new day.")
+
+                if daily_count >= 20:
+                    now = datetime.utcnow()
+                    next_day = now + timedelta(days=1)
+                    reset_time = datetime(year=next_day.year, month=next_day.month, day=next_day.day)
+                    time_remaining = reset_time - now
+                    hours, remainder = divmod(int(time_remaining.total_seconds()), 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    await update.message.reply_text(
+                        f"🚫 You have reached your daily limit of 20 requests. Please try again in {hours} hours and {minutes} minutes."
+                    )
+                    return ConversationHandler.END
+
+                # Increment the daily request count
+                await self.repository.increment_daily_request_count(user_id)
 
                 creds = await self.google_calendar_service.get_credentials(user_id)
                 if not creds or not creds.valid:
