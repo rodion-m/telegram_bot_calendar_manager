@@ -957,6 +957,13 @@ class InputHandler(BaseHandler):
                 # Handle voice or audio messages
                 is_voice = bool(update.message.voice or update.message.audio)
                 if is_voice:
+                    duration = update.message.voice.duration if update.message.voice else update.message.audio.duration
+                    if duration > 20:
+                        await update.message.reply_text(
+                            "Your audio message is longer than 20 seconds. Please send a shorter audio message (maximum 20 seconds)."
+                        )
+                        return ConversationHandler.END
+
                     # Handle voice or audio messages: download and transcribe
                     audio_bytes = await download_audio_in_memory(update.message, user_id)
                     encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
