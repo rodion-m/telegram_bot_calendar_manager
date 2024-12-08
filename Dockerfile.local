@@ -1,0 +1,40 @@
+# Dockerfile.local
+
+# Start from a lightweight Python base image
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Install OpenSSL for certificate generation
+RUN apt-get update && apt-get install -y --no-install-recommends openssl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy only requirements first to leverage build cache
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Generate self-signed certificates
+RUN openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+
+# Copy the rest of the project
+COPY . .
+
+# Set environment variables for local development
+ENV ENV=local
+ENV PORT=8443
+ENV GOOGLE_REDIRECT_URI=https://localhost:8443/google_callback
+
+ENV TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+ENV OPENAI_API_KEY=$OPENAI_API_KEY #optional
+ENV GEMINI_API_KEY=$GEMINI_API_KEY #optional
+ENV GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID
+ENV GOOGLE_CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
+
+
+# Expose the port your application runs on
+EXPOSE 8443
+
+# Run the application in local mode, which uses polling and also runs Quart
+CMD ["python", "main.py"]
