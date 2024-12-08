@@ -197,11 +197,11 @@ async def run_local():
         # Wait until a shutdown signal is received
         await stop_event.wait()
 
-    logger.info("Stopping bot.")
-    await application.updater.stop()
-    await application.stop()
-    await application.shutdown()
-    logger.info("Bot stopped successfully.")
+        logger.info("Stopping bot.")
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+        logger.info("Bot stopped successfully.")
 
     # Cancel the Quart task
     quart_task.cancel()
