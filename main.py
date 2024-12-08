@@ -75,17 +75,6 @@ conv_handler = ConversationHandler(
 
 application.add_handler(conv_handler)
 
-# Set Sentry DSN if available
-if config.SENTRY_DSN:
-    sentry_sdk.init(
-        dsn=config.SENTRY_DSN,
-        integrations=[],
-        traces_sample_rate=1.0,
-        profiles_sample_rate=1.0,
-        environment=config.ENV,
-    )
-    logger.info("Sentry SDK initialized.")
-
 # Function to set the webhook
 async def set_webhook():
     """Sets the webhook for the Telegram bot."""
