@@ -2,6 +2,8 @@
 
 import asyncio
 import os
+import signal
+import threading
 
 import sentry_sdk
 import uvicorn
@@ -164,11 +166,53 @@ async def delete_webhook():
     await application.bot.set_webhook(None)
 
 
-def run_local():
+async def run_local():
     """Runs the bot in local development mode using polling."""
     logger.info("Starting bot in local mode with polling.")
 
-    application.run_polling()
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    # Start Flask server in a separate daemon thread
+    def run_flask():
+        """Runs the Flask server."""
+        app.run(host='0.0.0.0', port=8443, debug=True, use_reloader=False, ssl_context=(f"{current_dir}/cert.pem", f"{current_dir}/key.pem"))
+
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started.")
+
+    logger.info("Running bot polling.")
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        logger.info("Bot polling started.")
+
+        # Create an asyncio Event to wait indefinitely
+        stop_event = asyncio.Event()
+
+        # Define signal handler to set the stop_event
+        def shutdown_handler():
+            logger.info("Shutdown signal received. Stopping bot...")
+            stop_event.set()
+
+        # Register signal handlers for graceful shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, shutdown_handler)
+            except NotImplementedError:
+                # Signal handling might not be implemented on some platforms (e.g., Windows)
+                logger.warning(f"Signal handling for {sig} not implemented on this platform.")
+
+        # Wait until a shutdown signal is received
+        await stop_event.wait()
+
+    logger.info("Stopping bot.")
+    await application.updater.stop()
+    await application.stop()
+    await application.shutdown()
+    logger.info("Bot stopped successfully.")
+
 
 # Function to run the bot in production mode using webhooks
 async def run_production():
@@ -194,7 +238,7 @@ async def run_production():
 def main():
     environment = config.ENV.lower()
     if environment == "local":
-        run_local()
+        asyncio.run(run_local())
     else:
         asyncio.run(run_production())
 
