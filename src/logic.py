@@ -306,7 +306,6 @@ class Config:
         self.SCOPES = ['https://www.googleapis.com/auth/calendar.events']
         self.SENTRY_DSN = os.getenv("SENTRY_DSN")
         self.ENV = os.getenv("ENV", "local")
-        self.LOGGING_MIN_LEVEL = os.getenv("LOGGING_MIN_LEVEL", "INFO")
 
         # Firestore configuration
         self.FIRESTORE_PROJECT = os.getenv("FIRESTORE_PROJECT")
