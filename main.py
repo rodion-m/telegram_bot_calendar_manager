@@ -1,32 +1,17 @@
 # main.py
 
-import asyncio
-import os
 import signal
 
-import sentry_sdk
 import uvicorn
 from quart import Quart, request, Response
-from loguru import logger
-from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
 
-from src.logic import (
-    Config,
-    GoogleCalendarService,
-    LiteLLMService,
-    StartHandler,
-    ConfirmationHandler,
-    InputHandler,
-    CancelHandler,
-    BotStates,
-)
+from src.logic import *
 
 # Initialize Quart App
 app = Quart(__name__)
@@ -43,7 +28,8 @@ litellm_service = LiteLLMService(config, google_calendar_service)
 application = Application.builder().token(config.TELEGRAM_TOKEN).build()
 
 # Initialize Handlers
-start_handler = StartHandler()
+start_handler = StartHandler(repository)
+password_handler = PasswordHandler(repository=repository)
 input_handler = InputHandler(litellm_service, google_calendar_service, repository)
 confirmation_handler = ConfirmationHandler(litellm_service, google_calendar_service, repository)
 cancel_handler = CancelHandler()
@@ -58,6 +44,7 @@ conv_handler = ConversationHandler(
         ),
     ],
     states={
+        BotStates.AUTHENTICATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler.handle)],
         BotStates.PARSE_INPUT: [
             MessageHandler((filters.TEXT | filters.VOICE | filters.AUDIO | filters.CAPTION) & ~filters.COMMAND, input_handler.handle)
         ],
@@ -71,6 +58,7 @@ conv_handler = ConversationHandler(
         ],
     },
     fallbacks=[CommandHandler("cancel", cancel_handler.handle)],
+    allow_reentry=False
 )
 
 application.add_handler(conv_handler)
@@ -112,7 +100,7 @@ async def google_callback():
         return "Invalid state parameter.", 400
 
     try:
-        creds = google_calendar_service.get_credentials(user_id, authorization_code=code)
+        creds = await google_calendar_service.get_credentials(user_id, authorization_code=code)
         if creds:
             # Notify the user via Telegram
             await application.bot.send_message(

@@ -48,8 +48,9 @@ class FallbacksModels:
 
 class BotStates:
     """States for the conversation handler."""
-    PARSE_INPUT = 1
-    CONFIRMATION = 2
+    AUTHENTICATE = 1
+    PARSE_INPUT = 2
+    CONFIRMATION = 3
 
 @contextmanager
 def start_span_smart(op: str, description: str) -> Generator[Any, None, None]:
@@ -164,10 +165,24 @@ class DynamoDbRepository(IRepository):
     async def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
         """Save user state to DynamoDB."""
         async with aioboto3.Session().client('dynamodb', region_name=self.region_name) as client:
-            item = await self.get_user_item(user_id)
-            item['state'] = {'M': {k: {'S': str(v)} for k, v in state.items()}}
-            await client.put_item(TableName=self.table_name, Item=item)
-            logger.info(f"Saved user state for user {user_id} to DynamoDB.")
+            key = await self.get_user_item(user_id)
+            # Retrieve existing state
+            response = await client.get_item(TableName=self.table_name, Key=key)
+            existing_item = response.get('Item', {})
+            existing_state = existing_item.get('state', {}).get('M', {})
+            # Merge existing state with new_state
+            merged_state = {k: v['S'] for k, v in existing_state.items()}
+            merged_state.update(state)
+            # Prepare the merged state for DynamoDB
+            merged_state_dynamodb = {'M': {k: {'S': str(v)} for k, v in merged_state.items()}}
+            # Update the item
+            await client.update_item(
+                TableName=self.table_name,
+                Key=key,
+                UpdateExpression="SET state = :s",
+                ExpressionAttributeValues={":s": merged_state_dynamodb['M']}
+            )
+            logger.info(f"Updated user state for user {user_id} in DynamoDB.")
 
     async def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve user state from DynamoDB."""
@@ -207,7 +222,7 @@ class TinyDbRepository(IRepository):
         self.tokens_table = self.db.table('tokens')
         self.state_table = self.db.table('state')
 
-    def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
+    async def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
         """
         Saves the authentication tokens for a user.
 
@@ -222,7 +237,7 @@ class TinyDbRepository(IRepository):
             User.user_id == user_id
         )
 
-    def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
+    async def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
         """
         Retrieves the authentication tokens for a user.
 
@@ -238,7 +253,7 @@ class TinyDbRepository(IRepository):
             return result.get('tokens')
         return None
 
-    def delete_tokens(self, user_id: int) -> None:
+    async def delete_tokens(self, user_id: int) -> None:
         """
         Deletes the authentication tokens for a user.
 
@@ -248,7 +263,7 @@ class TinyDbRepository(IRepository):
         User = Query()
         self.tokens_table.remove(User.user_id == user_id)
 
-    def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
+    async def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
         """
         Saves the state information for a user.
 
@@ -257,12 +272,18 @@ class TinyDbRepository(IRepository):
             state (Dict[str, Any]): A dictionary representing the user's state.
         """
         User = Query()
-        self.state_table.upsert(
-            {'user_id': user_id, 'state': state},
-            User.user_id == user_id
-        )
+        result = self.state_table.get(User.user_id == user_id)
+        if result:
+            existing_state = result.get('state', {})
+            existing_state.update(state)
+            self.state_table.update({'state': existing_state}, User.user_id == user_id)
+            logger.info(f"Updated user state for user {user_id} in TinyDB.")
+        else:
+            # If no existing state, create a new one
+            self.state_table.insert({'user_id': user_id, 'state': state})
+            logger.info(f"Created new user state for user {user_id} in TinyDB.")
 
-    def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+    async def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
         """
         Retrieves the state information for a user.
 
@@ -278,7 +299,7 @@ class TinyDbRepository(IRepository):
             return result.get('state')
         return None
 
-    def delete_user_state(self, user_id: int) -> None:
+    async def delete_user_state(self, user_id: int) -> None:
         """
         Deletes the state information for a user.
 
@@ -435,7 +456,7 @@ class GoogleCalendarService:
         self.logger.info(f"Generated auth URL for user {user_id}.")
         return authorization_url
 
-    def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials | None:
+    async def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials | None:
         """Gets or refreshes credentials for a user."""
         creds = None
 
@@ -464,11 +485,10 @@ class GoogleCalendarService:
             creds = flow.credentials
 
             # Save credentials using the repository
-            self.repository.save_tokens(user_id, json.loads(creds.to_json()))
+            await self.repository.save_tokens(user_id, json.loads(creds.to_json()))
             self.logger.info(f"Credentials obtained and saved for user {user_id}.")
-
         else:
-            tokens = self.repository.get_tokens(user_id)
+            tokens = await self.repository.get_tokens(user_id)
             if tokens:
                 creds = Credentials.from_authorized_user_info(info=tokens, scopes=self.SCOPES)
                 if creds and creds.expired and creds.refresh_token:
@@ -476,7 +496,7 @@ class GoogleCalendarService:
                     # Save the refreshed credentials
 
                     # Convert JSON string to dictionary before saving
-                    self.repository.save_tokens(user_id, json.loads(creds.to_json()))
+                    await self.repository.save_tokens(user_id, json.loads(creds.to_json()))
                     self.logger.info(f"Credentials refreshed and saved for user {user_id}.")
             else:
                 self.logger.debug(f"No tokens found for user {user_id}.")
@@ -488,7 +508,7 @@ class GoogleCalendarService:
         """Creates an event in Google Calendar."""
         with start_span_smart(op="google_calendar", description="Creating event"):
             try:
-                creds = await asyncio.to_thread(self.get_credentials, user_id)
+                creds = await self.get_credentials(user_id)
                 if not creds:
                     raise ValueError("Invalid credentials.")
                 service = build('calendar', 'v3', credentials=creds)
@@ -547,7 +567,7 @@ class GoogleCalendarService:
         """Deletes an event from Google Calendar based on identifier using LLM for relevance."""
         with start_span_smart(op="google_calendar", description="Deleting event"):
             try:
-                creds = await asyncio.to_thread(self.get_credentials, user_id)
+                creds = await self.get_credentials(user_id)
                 if not creds:
                     raise ValueError("Invalid credentials.")
                 service = build('calendar', 'v3', credentials=creds)
@@ -597,7 +617,7 @@ class GoogleCalendarService:
         if self.users_timezone_cache.get(user_id):
             return self.users_timezone_cache[user_id]
 
-        creds = await asyncio.to_thread(self.get_credentials, user_id)
+        creds = await self.get_credentials(user_id)
         service = build('calendar', 'v3', credentials=creds)
         timezone: dict[str, str] = service.settings().get(setting='timezone').execute()
         return timezone['value']
@@ -612,7 +632,7 @@ class GoogleCalendarService:
                 new_time = details.get('new_time')
                 new_timezone = details.get('new_timezone', str(get_localzone()))
 
-                creds = await asyncio.to_thread(self.get_credentials, user_id)
+                creds = await self.get_credentials(user_id)
                 if not creds:
                     raise ValueError("Invalid credentials.")
                 service = build('calendar', 'v3', credentials=creds)
@@ -938,7 +958,15 @@ class InputHandler(BaseHandler):
 
             # Check if user has valid credentials
             try:
-                creds = self.google_calendar_service.get_credentials(user_id)
+                user_state = await self.repository.get_user_state(user_id)
+                if not user_state or not user_state.get("authenticated"):
+                    await update.message.reply_text(
+                        "🔒 You need to authenticate before accessing the bot's functionalities.\n"
+                        "Please enter password to authenticate."
+                    )
+                    return BotStates.AUTHENTICATE
+
+                creds = await self.google_calendar_service.get_credentials(user_id)
                 if not creds or not creds.valid:
                     # Generate auth URL and prompt user
                     auth_url = self.google_calendar_service.generate_auth_url(user_id)
@@ -1231,23 +1259,67 @@ class CancelHandler(BaseHandler):
 class StartHandler(BaseHandler):
     """Handler for the /start command."""
 
-    def __init__(self):
+    def __init__(self, repository: IRepository):
         self.logger = logger
+        self.repository = repository
 
     async def handle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         try:
             self.logger.info("Start command received")
+            user_id: int = update.effective_user.id
+
+            # Check if the user is already authenticated
+            user_state = await self.repository.get_user_state(user_id)
+            if user_state and user_state.get("authenticated"):
+                await update.message.reply_text(
+                    "👋 Welcome back! You are already authenticated. How can I assist you today?"
+                )
+                return BotStates.PARSE_INPUT
+
             await update.message.reply_text(
-                "Hi! I can help you manage your Google Calendar events.\n\n"
-                "You can:\n"
-                "- Add a new event by sending event details.\n"
-                "- Delete an event by sending a command like 'Delete [event name]'.\n"
-                "- Reschedule an event by sending a command like 'Reschedule [event name]'.\n"
-                "- Send audio messages with event details or commands."
+                "🔒 To access the bot's functionalities, please enter the access password."
             )
-            return BotStates.PARSE_INPUT
+            return BotStates.AUTHENTICATE
         except Exception as e:
             self.logger.error(f"Error in StartHandler: {e}")
             sentry_sdk.capture_exception(e)
-            await update.message.reply_text(f"An error occurred while starting the bot.\n{e}")
+            await update.message.reply_text(f"⚠️ An error occurred while starting the bot.\n{e}")
             return ConversationHandler.END
+
+class PasswordHandler(BaseHandler):
+    """Handler for processing user password input."""
+
+    def __init__(self, repository: IRepository):
+        self.repository = repository
+        self.logger = logger
+        self.PASSWORD = "Эволюция Кода".lower()  # Define the password in lowercase for case-insensitive comparison
+
+    async def handle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        with sentry_sdk.start_transaction(op="handler", name="PasswordHandler.handle"):
+            try:
+                self.logger.info("Password handler triggered")
+                user_id: int = update.effective_user.id
+                user_input: str = update.message.text.strip().lower()
+
+                if user_input == self.PASSWORD:
+                    # Save authenticated status in user state
+                    await self.repository.save_user_state(user_id, {"authenticated": True})
+                    self.logger.info(f"User {user_id} authenticated successfully.")
+                    await update.message.reply_text("✅ Authentication successful! You now have access to the bot's functionalities.")
+                    await update.message.reply_text(
+                        "Hi! I can help you manage your Google Calendar events.\n\n"
+                        "You can:\n"
+                        "- Add a new event by sending event details.\n"
+                        "- Delete an event by sending a command like 'Delete [event name]'.\n"
+                        "- Send audio messages with event details or commands."
+                    )
+                    return BotStates.PARSE_INPUT
+                else:
+                    self.logger.warning(f"User {user_id} provided an incorrect password.")
+                    await update.message.reply_text("❌ Incorrect password. Please try again or type /cancel to exit.")
+                    return BotStates.AUTHENTICATE  # Remain in the AUTHENTICATE state
+            except Exception as e:
+                self.logger.error(f"Error in PasswordHandler: {e}")
+                sentry_sdk.capture_exception(e)
+                await update.message.reply_text(f"⚠️ An error occurred during authentication.\n{e}")
+                return ConversationHandler.END
