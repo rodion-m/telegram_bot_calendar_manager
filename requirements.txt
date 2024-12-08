@@ -19,3 +19,5 @@ google-cloud-firestore~=2.19.0
 aioboto3~=13.2.0
 tinydb~=4.8.2
 quart~=0.19.9
+pyjwt~=2.10.1
+cryptography~=44.0.0

@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional, Union, Generator
 from contextlib import contextmanager
 
 import aioboto3
+import jwt
 import litellm
 import pytz
 import telegram
@@ -495,6 +496,11 @@ class Config:
         # Initialize cipher (will use a random IV for each encryption)
         self.backend = default_backend()
 
+        self.JWT_SECRET = os.getenv("JWT_SECRET")
+        self.JWT_ALGORITHM = "HS256"
+        if not self.JWT_SECRET:
+            raise ValueError("JWT_SECRET environment variable not set.")
+
         # Initialize Sentry SDK for production
         if self.SENTRY_DSN:
             sentry_logging = LoggingIntegration(
@@ -586,9 +592,11 @@ class GoogleCalendarService:
         self.SCOPES = self.config.SCOPES
         self.logger = logger
         self.users_timezone_cache: dict[int, str] = {}
+        self.jwt_secret = config.JWT_SECRET
+        self.jwt_algorithm = config.JWT_ALGORITHM
 
     def generate_auth_url(self, user_id: int) -> str:
-        """Generates the OAuth 2.0 authorization URL for the user."""
+        """Generates the OAuth 2.0 authorization URL for the user with JWT-encoded state."""
         client_config = {
             "web": {
                 "client_id": self.config.GOOGLE_CLIENT_ID,
@@ -605,15 +613,22 @@ class GoogleCalendarService:
             redirect_uri=self.config.GOOGLE_REDIRECT_URI
         )
 
-        # Embed user_id in state for mapping after callback
-        authorization_url, state = flow.authorization_url(
+        # Create JWT token containing the user_id and expiration time
+        payload = {
+            "user_id": user_id,
+            "exp": datetime.utcnow() + timedelta(hours=1),  # Token expires in 1 hour
+            "iat": datetime.utcnow(),
+        }
+        state_jwt = jwt.encode(payload, self.jwt_secret, algorithm=self.jwt_algorithm)
+
+        authorization_url, _ = flow.authorization_url(
             access_type='offline',
             include_granted_scopes='true',
-            state=str(user_id),  # TODO: Encrypt with JWT for security
+            state=state_jwt,  # Use JWT as state
             prompt='consent'  # Forces consent screen to ensure refresh_token is received
         )
 
-        self.logger.info(f"Generated auth URL for user {user_id}.")
+        self.logger.info(f"Generated auth URL with JWT state for user {user_id}.")
         return authorization_url
 
     async def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials | None:

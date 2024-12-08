@@ -3,6 +3,7 @@
 import signal
 
 import uvicorn
+from jwt import InvalidTokenError
 from quart import Quart, request, Response
 from telegram.ext import (
     Application,
@@ -84,19 +85,30 @@ async def index():
     return 'OK', 200
 
 # Quart route for handling Google OAuth callback
+# main.py
+
 @app.route('/google_callback', methods=['GET'])
 async def google_callback():
     code = request.args.get('code')
-    state = request.args.get('state')  # Contains user_id
+    state = request.args.get('state')  # Contains JWT
 
     if not code or not state:
         logger.warning("Missing authorization code or state parameter.")
         return "Missing authorization code or state parameter.", 400
 
     try:
-        user_id = int(state)
-    except ValueError:
-        logger.error("Invalid state parameter.")
+        # Decode and verify JWT
+        payload = jwt.decode(state, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
+        user_id = payload.get("user_id")
+        if not user_id:
+            logger.error("JWT does not contain user_id.")
+            return "Invalid state parameter.", 400
+    except InvalidTokenError as e:
+        logger.error(f"Invalid JWT in state parameter: {e}")
+        return "Invalid state parameter.", 400
+    except Exception as e:
+        logger.error(f"Error decoding JWT in state parameter: {e}")
+        sentry_sdk.capture_exception(e)
         return "Invalid state parameter.", 400
 
     try:
@@ -105,7 +117,7 @@ async def google_callback():
             # Notify the user via Telegram
             await application.bot.send_message(
                 chat_id=user_id,
-                text="Authorization successful! You can now continue using the bot."
+                text="✅ Authorization successful! You can now continue using the bot."
             )
             logger.info(f"User {user_id} authorized successfully.")
             return "Authorization successful! You can now return to the bot and continue.", 200
