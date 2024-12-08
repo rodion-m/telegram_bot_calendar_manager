@@ -3,12 +3,10 @@
 import asyncio
 import os
 import signal
-import threading
 
 import sentry_sdk
 import uvicorn
-from asgiref.wsgi import WsgiToAsgi
-from flask import Flask, request, Response
+from quart import Quart, request, Response
 from loguru import logger
 from telegram import Update
 from telegram.ext import (
@@ -17,7 +15,6 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
-    ExtBot
 )
 
 from src.logic import (
@@ -31,8 +28,8 @@ from src.logic import (
     BotStates,
 )
 
-# Initialize Flask App
-app = Flask(__name__)
+# Initialize Quart App
+app = Quart(__name__)
 
 # Load Configuration
 config = Config()
@@ -104,12 +101,12 @@ async def set_webhook():
         logger.error(f"Failed to set webhook to {webhook_endpoint}")
     return success
 
-# Flask route for the root
+# Quart route for the root
 @app.route('/', methods=['GET'])
-def index():
+async def index():
     return 'OK', 200
 
-# Flask route for handling Google OAuth callback
+# Quart route for handling Google OAuth callback
 @app.route('/google_callback', methods=['GET'])
 async def google_callback():
     code = request.args.get('code')
@@ -143,11 +140,11 @@ async def google_callback():
         sentry_sdk.capture_exception(e)
         return "Authorization failed! Please try again.", 200
 
-# Flask route for handling Telegram webhooks
+# Quart route for handling Telegram webhooks
 @app.route('/telegram', methods=['POST'])
 async def telegram_webhook():
     try:
-        update_json = request.get_json(force=True)
+        update_json = await request.get_json(force=True)
         if not update_json:
             logger.error("No update received")
             return Response(status=400)
@@ -161,25 +158,29 @@ async def telegram_webhook():
         return Response(status=500)
 
 # Function to run the bot in local development mode using polling
-async def delete_webhook():
-    """Removes the webhook for the Telegram bot."""
-    await application.bot.set_webhook(None)
-
-
 async def run_local():
     """Runs the bot in local development mode using polling."""
     logger.info("Starting bot in local mode with polling.")
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Start Flask server in a separate daemon thread
-    def run_flask():
-        """Runs the Flask server."""
-        app.run(host='0.0.0.0', port=8443, debug=True, use_reloader=False, ssl_context=(f"{current_dir}/cert.pem", f"{current_dir}/key.pem"))
 
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started.")
+    # Start the Quart server as a background task
+    async def run_quart():
+        """Runs the Quart server."""
+        logger.info("Starting Quart server.")
+        await app.run_task(
+            host='0.0.0.0',
+            port=8443,
+            debug=True,
+            certfile=f"{current_dir}/cert.pem",
+            keyfile=f"{current_dir}/key.pem",
+        )
 
+    quart_task = asyncio.create_task(run_quart())
+
+    logger.info("Quart server started.")
+
+    # Start the Telegram bot polling
     logger.info("Running bot polling.")
     async with application:
         await application.initialize()
@@ -213,6 +214,12 @@ async def run_local():
     await application.shutdown()
     logger.info("Bot stopped successfully.")
 
+    # Cancel the Quart task
+    quart_task.cancel()
+    try:
+        await quart_task
+    except asyncio.CancelledError:
+        logger.info("Quart server stopped.")
 
 # Function to run the bot in production mode using webhooks
 async def run_production():
@@ -222,10 +229,10 @@ async def run_production():
     # Set the webhook
     await set_webhook()
 
-    # Serve the Flask app using Uvicorn
+    # Serve the Quart app using Uvicorn
     server = uvicorn.Server(
         config=uvicorn.Config(
-            app=WsgiToAsgi(app),
+            app=app,
             host="0.0.0.0",
             port=int(os.getenv("PORT", 8443)),
             log_level="info",

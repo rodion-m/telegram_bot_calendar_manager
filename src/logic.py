@@ -22,7 +22,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from litellm import acompletion
 from pydantic import BaseModel, Field
-from sentry_sdk.integrations.flask import FlaskIntegration
+from sentry_sdk.integrations.quart import QuartIntegration
 from tinydb import Query, TinyDB
 from tzlocal import get_localzone
 
@@ -322,10 +322,7 @@ class Config:
                 dsn=self.SENTRY_DSN,
                 integrations=[
                     sentry_logging,
-                    FlaskIntegration(
-                        transaction_style="url",
-                        http_methods_to_capture=("GET","POST"),
-                    ),
+                    QuartIntegration(),
                 ],
                 traces_sample_rate=1.0,  # Adjust based on your needs
                 profiles_sample_rate=1.0,  # Profile 100% of sampled transactions
