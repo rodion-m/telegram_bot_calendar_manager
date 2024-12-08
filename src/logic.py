@@ -303,7 +303,10 @@ class Config:
         self.GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
         self.GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
         self.GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-        self.SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+        self.SCOPES = [
+            'https://www.googleapis.com/auth/calendar.events',
+            'https://www.googleapis.com/auth/calendar.settings.readonly'
+        ]
         self.SENTRY_DSN = os.getenv("SENTRY_DSN")
         self.ENV = os.getenv("ENV", "local")
 
@@ -401,6 +404,7 @@ class GoogleCalendarService:
         self.repository = repository
         self.SCOPES = self.config.SCOPES
         self.logger = logger
+        self.users_timezone_cache: dict[int, str] = {}
 
     def generate_auth_url(self, user_id: int) -> str:
         """Generates the OAuth 2.0 authorization URL for the user."""
@@ -588,6 +592,16 @@ class GoogleCalendarService:
                 sentry_sdk.capture_exception(e)
                 return {"status": "error", "error": str(e)}
 
+    async def get_user_timezone(self, user_id: int) -> Optional[str]:
+        """Fetch the user's timezone using Google Calendar API."""
+        if self.users_timezone_cache.get(user_id):
+            return self.users_timezone_cache[user_id]
+
+        creds = await asyncio.to_thread(self.get_credentials, user_id)
+        service = build('calendar', 'v3', credentials=creds)
+        timezone: dict[str, str] = service.settings().get(setting='timezone').execute()
+        return timezone['value']
+
     async def reschedule_event(self, details: Dict[str, Any], user_id: int, update: Update) -> Dict[str, Any]:
         """Reschedules an existing event based on identifier and new details using LLM for relevance."""
         # TODO: Reimplement this feature
@@ -641,7 +655,7 @@ class GoogleCalendarService:
                 start_datetime = pytz.timezone(new_timezone).localize(start_datetime)
                 end_datetime = start_datetime + timedelta(hours=1)  # Default duration
                 if not new_timezone:
-                    new_timezone = str(get_localzone())
+                    new_timezone = str(await self.get_user_timezone(user_id))
 
                 new_event: Dict[str, Any] = {
                     'start': {
@@ -947,7 +961,7 @@ class InputHandler(BaseHandler):
                     audio_bytes = await download_audio_in_memory(update.message, user_id)
                     encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
                     messages = [
-                        {"role": "system", "content": self.get_system_prompt()},
+                        {"role": "system", "content": self.get_system_prompt(await self.google_calendar_service.get_user_timezone(user_id))},
                         {
                             "role": "user",
                             "content": [
@@ -972,7 +986,7 @@ class InputHandler(BaseHandler):
                         return ConversationHandler.END
 
                     messages = [
-                        {"role": "system", "content": self.get_system_prompt()},
+                        {"role": "system", "content": self.get_system_prompt(await self.google_calendar_service.get_user_timezone(user_id))},
                         {"role": "user", "content": user_message},
                     ]
 
@@ -1074,9 +1088,9 @@ class InputHandler(BaseHandler):
                 await update.message.reply_text(f"An unexpected error occurred.\n{e}")
                 return ConversationHandler.END
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, iana_timezone: str) -> str:
         """Returns the system prompt for LLM."""
-        now = datetime.now().astimezone()
+        now = datetime.now(pytz.timezone(iana_timezone))
         return f"""
             You are a smart calendar assistant. Your primary task is to help users manage their events efficiently by adding new events, deleting existing events, or rescheduling events in the user's calendar.
 
@@ -1091,7 +1105,7 @@ class InputHandler(BaseHandler):
             Here's the current context:
             <context>
             Today's date and time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}
-            User's Timezone: {get_localzone()} (can be different from the event timezone)
+            User's Timezone: {iana_timezone} (can be different from the event timezone)
             Day of the week: {now.strftime('%A')}
             </context>
         """
