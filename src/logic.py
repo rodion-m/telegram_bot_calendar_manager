@@ -479,7 +479,7 @@ class GoogleCalendarService:
                     self.repository.save_tokens(user_id, json.loads(creds.to_json()))
                     self.logger.info(f"Credentials refreshed and saved for user {user_id}.")
             else:
-                self.logger.warning(f"No tokens found for user {user_id}.")
+                self.logger.debug(f"No tokens found for user {user_id}.")
                 return None
 
         return creds
