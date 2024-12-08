@@ -23,6 +23,7 @@ from googleapiclient.discovery import build
 from litellm import acompletion
 from pydantic import BaseModel, Field
 from sentry_sdk.integrations.flask import FlaskIntegration
+from tinydb import Query, TinyDB
 from tzlocal import get_localzone
 
 from telegram import Update, Message, ReplyKeyboardRemove
@@ -188,129 +189,104 @@ class DynamoDbRepository(IRepository):
             await client.update_item(TableName=self.table_name, Key=key, UpdateExpression=update_expression)
             logger.info(f"Deleted user state for user {user_id} from DynamoDB.")
 
-class FirestoreRepository(IRepository):
-    """Repository implementation using Google Firestore."""
+class TinyDbRepository(IRepository):
+    """Repository implementation using TinyDB."""
 
-    def __init__(self, config: 'Config'):
-        from google.cloud import firestore
-        self.client = firestore.AsyncClient()
-        self.collection = config.FIRESTORE_COLLECTION
-        self.logger = logger
+    def __init__(self, db_path: str = "tinydb.json"):
+        """
+        Initializes the TinyDbRepository.
 
-    from google.cloud import firestore
-    async def get_user_document(self, user_id: int) -> firestore.AsyncDocumentReference:
-        """Get a reference to the user's document."""
-        with start_span_smart(op="firestore", description="Get User Document"):
-            return self.client.collection(self.collection).document(str(user_id))
+        Args:
+            db_path (str): Path to the TinyDB JSON file. Defaults to "tinydb.json".
+        """
+        # Define the path to the TinyDB JSON file
+        self.db_path = os.path.abspath(db_path)
+        self.db = TinyDB(self.db_path)
 
-    async def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
-        """Save OAuth tokens to Firestore."""
-        with start_span_smart(op="firestore", description="Save Tokens"):
-            user_doc = await self.get_user_document(user_id)
-            await user_doc.set({"tokens": tokens}, merge=True)
-            self.logger.info(f"Saved tokens for user {user_id} to Firestore.")
-
-    async def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Retrieve OAuth tokens from Firestore."""
-        user_doc = await self.get_user_document(user_id)
-        with start_span_smart(op="firestore", description="Get Tokens"):
-            doc = await user_doc.get()
-            if doc.exists:
-                tokens = doc.to_dict().get("tokens")
-                self.logger.info(f"Retrieved tokens for user {user_id} from Firestore.")
-                return tokens
-        return None
-
-    async def delete_tokens(self, user_id: int) -> None:
-        """Delete OAuth tokens from Firestore."""
-        from google.cloud import firestore
-        with start_span_smart(op="firestore", description="Delete Tokens"):
-            user_doc = await self.get_user_document(user_id)
-            await user_doc.update({"tokens": firestore.DELETE_FIELD})
-            self.logger.info(f"Deleted tokens for user {user_id} from Firestore.")
-
-    async def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
-        """Save user state to Firestore."""
-        with start_span_smart(op="firestore", description="Save User State"):
-            user_doc = await self.get_user_document(user_id)
-            await user_doc.set({"state": state}, merge=True)
-            self.logger.info(f"Saved user state for user {user_id} to Firestore.")
-
-    async def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Retrieve user state from Firestore."""
-        with start_span_smart(op="firestore", description="Get User State"):
-            user_doc = await self.get_user_document(user_id)
-            doc = await user_doc.get()
-            if doc.exists:
-                state = doc.to_dict().get("state")
-                self.logger.info(f"Retrieved user state for user {user_id} from Firestore.")
-                return state
-            return None
-
-    async def delete_user_state(self, user_id: int) -> None:
-        """Delete user state from Firestore."""
-        with start_span_smart(op="firestore", description="Delete User State"):
-            user_doc = await self.get_user_document(user_id)
-            from google.cloud import firestore
-            await user_doc.update({"state": firestore.DELETE_FIELD})
-            self.logger.info(f"Deleted user state for user {user_id} from Firestore.")
-
-
-class FileSystemRepository(IRepository):
-    """Repository implementation using the local filesystem."""
-
-    def __init__(self, config: 'Config'):
-        self.token_dir = os.path.abspath("../google_tokens")
-        os.makedirs(self.token_dir, exist_ok=True)
-        self.logger = logger
-
-    def _get_token_path(self, user_id: int) -> str:
-        return os.path.join(self.token_dir, f"token_{user_id}.json")
-
-    def _get_state_path(self, user_id: int) -> str:
-        return os.path.join(self.token_dir, f"state_{user_id}.json")
+        # Create separate tables for tokens and user states
+        self.tokens_table = self.db.table('tokens')
+        self.state_table = self.db.table('state')
 
     def save_tokens(self, user_id: int, tokens: Dict[str, Any]) -> None:
-        path = self._get_token_path(user_id)
-        with open(path, 'w') as f:
-            json.dump(tokens, f)
-        self.logger.info(f"Saved tokens for user {user_id} to {path}")
+        """
+        Saves the authentication tokens for a user.
+
+        Args:
+            user_id (int): The unique identifier of the user.
+            tokens (Dict[str, Any]): A dictionary of token data.
+        """
+        User = Query()
+        # Upsert ensures that the record is updated if it exists, or inserted if it doesn't
+        self.tokens_table.upsert(
+            {'user_id': user_id, 'tokens': tokens},
+            User.user_id == user_id
+        )
 
     def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
-        path = self._get_token_path(user_id)
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                tokens = json.load(f)
-            self.logger.info(f"Retrieved tokens for user {user_id} from {path}")
-            return tokens
+        """
+        Retrieves the authentication tokens for a user.
+
+        Args:
+            user_id (int): The unique identifier of the user.
+
+        Returns:
+            Optional[Dict[str, Any]]: The tokens dictionary if found, else None.
+        """
+        User = Query()
+        result = self.tokens_table.get(User.user_id == user_id)
+        if result:
+            return result.get('tokens')
         return None
 
     def delete_tokens(self, user_id: int) -> None:
-        path = self._get_token_path(user_id)
-        if os.path.exists(path):
-            os.remove(path)
-            self.logger.info(f"Deleted tokens for user {user_id} from {path}")
+        """
+        Deletes the authentication tokens for a user.
+
+        Args:
+            user_id (int): The unique identifier of the user.
+        """
+        User = Query()
+        self.tokens_table.remove(User.user_id == user_id)
 
     def save_user_state(self, user_id: int, state: Dict[str, Any]) -> None:
-        path = self._get_state_path(user_id)
-        with open(path, 'w') as f:
-            json.dump(state, f)
-        self.logger.info(f"Saved user state for user {user_id} to {path}")
+        """
+        Saves the state information for a user.
+
+        Args:
+            user_id (int): The unique identifier of the user.
+            state (Dict[str, Any]): A dictionary representing the user's state.
+        """
+        User = Query()
+        self.state_table.upsert(
+            {'user_id': user_id, 'state': state},
+            User.user_id == user_id
+        )
 
     def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
-        path = self._get_state_path(user_id)
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                state = json.load(f)
-            self.logger.info(f"Retrieved user state for user {user_id} from {path}")
-            return state
+        """
+        Retrieves the state information for a user.
+
+        Args:
+            user_id (int): The unique identifier of the user.
+
+        Returns:
+            Optional[Dict[str, Any]]: The state dictionary if found, else None.
+        """
+        User = Query()
+        result = self.state_table.get(User.user_id == user_id)
+        if result:
+            return result.get('state')
         return None
 
     def delete_user_state(self, user_id: int) -> None:
-        path = self._get_state_path(user_id)
-        if os.path.exists(path):
-            os.remove(path)
-            self.logger.info(f"Deleted user state for user {user_id} from {path}")
+        """
+        Deletes the state information for a user.
+
+        Args:
+            user_id (int): The unique identifier of the user.
+        """
+        User = Query()
+        self.state_table.remove(User.user_id == user_id)
 
 class Config:
     """Configuration management using environment variables."""
@@ -361,7 +337,7 @@ class Config:
         """Returns the appropriate repository based on the environment."""
         if self.ENV.lower() == "local":
             logger.info("Using FileSystemRepository for local environment.")
-            return FileSystemRepository(self)
+            return TinyDbRepository()
         else:
             logger.info("Using DynamoDbRepository for production environment.")
             return DynamoDbRepository()
