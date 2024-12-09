@@ -1,5 +1,8 @@
 # Dockerfile.local
 
+# build: docker build -f Dockerfile.local -t tg-bot-gcalendar-assistant:{version} .
+# run: docker run -d --name tg-bot-gcalendar-assistant -p 8443:8443 tg-bot-gcalendar-assistant:{version}
+
 # Start from a lightweight Python base image
 FROM python:3.11-slim AS builder
 
@@ -31,7 +34,6 @@ ENV OPENAI_API_KEY=$OPENAI_API_KEY #optional
 ENV GEMINI_API_KEY=$GEMINI_API_KEY #optional
 ENV GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID
 ENV GOOGLE_CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
-
 
 # Expose the port your application runs on
 EXPOSE 8443
