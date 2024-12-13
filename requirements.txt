@@ -1,6 +1,6 @@
 google_api_python_client==2.154.0
 google_auth_oauthlib==1.2.1
-litellm==1.53.1
+litellm==1.55.0
 loguru==0.7.2
 protobuf==5.29.0
 pydantic==2.10.2

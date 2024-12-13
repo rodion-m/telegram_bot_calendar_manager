@@ -36,10 +36,9 @@ from sentry_sdk.integrations.logging import LoggingIntegration
 from loguru import logger
 
 # Constants
-SEARCH_MODEL = "gemini/gemini-1.5-flash-002"
-COMMANDS_MODEL_VOICE = "gemini/gemini-1.5-flash-002"
-COMMANDS_MODEL_TEXT = "gemini/gemini-1.5-flash-002"
-# COMMANDS_MODEL_TEXT = "openai/gpt-4o"
+SEARCH_MODEL = "gemini/gemini-2.0-flash-exp"
+COMMANDS_MODEL_VOICE = "gemini/gemini-2.0-flash-exp"
+COMMANDS_MODEL_TEXT = "gemini/gemini-2.0-flash-exp"
 
 # TODO: Reimplement reschedule_event feature, cause it's complex
 
