@@ -21,3 +21,4 @@ tinydb~=4.8.2
 quart~=0.19.9
 pyjwt~=2.10.1
 cryptography~=44.0.0
+requests~=2.32.3

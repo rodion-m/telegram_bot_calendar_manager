@@ -1,39 +1,37 @@
 # logic.py
 
+import asyncio
 import base64
 import datetime
 import json
 import os
-import asyncio
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union, Generator
-
-from contextlib import contextmanager
 
 import aioboto3
 import jwt
 import litellm
 import pytz
+import sentry_sdk
 import telegram
 from cryptography.hazmat.backends import default_backend
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from litellm import acompletion
+from loguru import logger
 from pydantic import BaseModel, Field
+from requests import HTTPError
+from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.quart import QuartIntegration
-from tinydb import Query, TinyDB
-from tzlocal import get_localzone
-
 from telegram import Update, Message, ReplyKeyboardRemove
 from telegram.ext import ContextTypes, ConversationHandler
-
-import sentry_sdk
-from sentry_sdk.integrations.logging import LoggingIntegration
-from loguru import logger
+from tinydb import Query, TinyDB
+from tzlocal import get_localzone
 
 # Constants
 SEARCH_MODEL = "gemini/gemini-2.0-flash-exp"
@@ -320,6 +318,8 @@ class DynamoDbRepository(IRepository):
             )
             logger.info(f"Reset daily request count for user {user_id} on {new_date}.")
 
+
+# noinspection PyTypeChecker
 class TinyDbRepository(IRepository):
     """Repository implementation using TinyDB."""
 
@@ -346,11 +346,11 @@ class TinyDbRepository(IRepository):
             user_id (int): The unique identifier of the user.
             tokens (Dict[str, Any]): A dictionary of token data.
         """
-        User = Query()
+        user = Query()
         # Upsert ensures that the record is updated if it exists, or inserted if it doesn't
         self.tokens_table.upsert(
             {'user_id': user_id, 'tokens': tokens},
-            User.user_id == user_id
+            user.user_id == user_id
         )
 
     async def get_tokens(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -632,10 +632,12 @@ class GoogleCalendarService:
 
     async def get_credentials(self, user_id: int, authorization_code: Optional[str] = None) -> Credentials | None:
         """Gets or refreshes credentials for a user."""
+        max_retries = 2
+        retry_delay = 3  # seconds
         creds = None
 
         if authorization_code:
-            # Initialize Flow with client_config and scopes
+            # Existing logic to fetch tokens using authorization_code
             client_config = {
                 "web": {
                     "client_id": self.config.GOOGLE_CLIENT_ID,
@@ -654,24 +656,48 @@ class GoogleCalendarService:
 
             with start_span_smart(op="google_calendar", description="Get Credentials"):
                 # Fetch token using authorization_code
-                flow.fetch_token(code=authorization_code)
+                try:
+                    flow.fetch_token(code=authorization_code)
+                    creds = flow.credentials
 
-            creds = flow.credentials
+                    # Save credentials using the repository
+                    await self.repository.save_tokens(user_id, json.loads(creds.to_json()))
+                    self.logger.info(f"Credentials obtained and saved for user {user_id}.")
+                except Exception as e:
+                    self.logger.error(f"Error fetching tokens for user {user_id}: {e}")
+                    sentry_sdk.capture_exception(e)
+                    return None
 
-            # Save credentials using the repository
-            await self.repository.save_tokens(user_id, json.loads(creds.to_json()))
-            self.logger.info(f"Credentials obtained and saved for user {user_id}.")
         else:
             tokens = await self.repository.get_tokens(user_id)
             if tokens:
                 creds = Credentials.from_authorized_user_info(info=tokens, scopes=self.SCOPES)
                 if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                    # Save the refreshed credentials
-
-                    # Convert JSON string to dictionary before saving
-                    await self.repository.save_tokens(user_id, json.loads(creds.to_json()))
-                    self.logger.info(f"Credentials refreshed and saved for user {user_id}.")
+                    for attempt in range(1, max_retries + 1):
+                        try:
+                            creds.refresh(Request())
+                            # Save the refreshed credentials
+                            await self.repository.save_tokens(user_id, json.loads(creds.to_json()))
+                            self.logger.info(f"Credentials refreshed and saved for user {user_id}.")
+                            break  # Exit retry loop on success
+                        except RefreshError as e:
+                            # Token has been revoked or expired
+                            self.logger.error(f"Failed to refresh tokens for user {user_id}: {e}")
+                            sentry_sdk.capture_exception(e)
+                            await self.repository.delete_tokens(user_id)
+                            await self.repository.delete_user_state(user_id)
+                            return None
+                        except HTTPError as e:
+                            # Network or other HTTP errors
+                            self.logger.error(f"HTTP error when refreshing tokens for user {user_id}: {e}")
+                            sentry_sdk.capture_exception(e)
+                            if attempt < max_retries:
+                                self.logger.info(
+                                    f"Retrying token refresh in {retry_delay} seconds... (Attempt {attempt}/{max_retries})")
+                                await asyncio.sleep(retry_delay)
+                            else:
+                                self.logger.error(f"Max retries reached. Unable to refresh tokens for user {user_id}.")
+                                return None
             else:
                 self.logger.debug(f"No tokens found for user {user_id}.")
                 return None
@@ -1171,9 +1197,9 @@ class InputHandler(BaseHandler):
                     # Generate auth URL and prompt user
                     auth_url = self.google_calendar_service.generate_auth_url(user_id)
                     await update.message.reply_text(
-                        "You need to authorize access to your Google Calendar. Please click the link below to authorize:",
+                        "🔒 Your Google Calendar authorization has expired or been revoked. Please re-authorize access to continue using the bot's functionalities.",
                         reply_markup=telegram.InlineKeyboardMarkup([
-                            [telegram.InlineKeyboardButton("Authorize", url=auth_url)]
+                            [telegram.InlineKeyboardButton("Re-authorize", url=auth_url)]
                         ])
                     )
                     return ConversationHandler.END
